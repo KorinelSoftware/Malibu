@@ -470,7 +470,16 @@ void apply_property(ComputedStyle& s, const ComputedStyle& parent,
                          : (lv == u"bottom") ? VerticalAlign::Bottom : (lv == u"sub") ? VerticalAlign::Sub
                          : (lv == u"super") ? VerticalAlign::Super : VerticalAlign::Baseline;
     } else if (prop == u"border-radius") {
-        s.border_radius = parse_length(value).resolve(s.font_size, 0, 16.0f, 0, 0);
+        if (!lv.empty() && lv.back() == u'%') {
+            s.border_radius_percent =
+                std::clamp(parse_float(lv.substr(0, lv.size() - 1)) / 100.0f,
+                           0.0f, 1.0f);
+            s.border_radius = 0.0f;
+        } else {
+            s.border_radius =
+                parse_length(value).resolve(s.font_size, 0, 16.0f, 0, 0);
+            s.border_radius_percent = 0.0f;
+        }
     } else if (prop == u"aspect-ratio") {
         // "W / H" or a single number.
         size_t slash = value.find(u'/');
@@ -570,6 +579,16 @@ void apply_property(ComputedStyle& s, const ComputedStyle& parent,
     } else if (prop == u"object-fit") {
         s.object_fit = (lv == u"contain") ? ObjectFit::Contain : (lv == u"cover") ? ObjectFit::Cover
                      : (lv == u"none") ? ObjectFit::None : (lv == u"scale-down") ? ObjectFit::ScaleDown : ObjectFit::Fill;
+    } else if (prop == u"content") {
+        if (lv == u"none" || lv == u"normal") {
+            s.generates_content = false;
+            s.generated_content.clear();
+        } else if (value.size() >= 2 &&
+                   ((value.front() == u'"' && value.back() == u'"') ||
+                    (value.front() == u'\'' && value.back() == u'\''))) {
+            s.generates_content = true;
+            s.generated_content = value.substr(1, value.size() - 2);
+        }
     } else if (prop == u"font-size") {
         float kw = font_size_keyword(lv, parent.font_size);
         if (kw >= 0.0f) s.font_size = kw;
@@ -735,7 +754,9 @@ void StyleResolver::add_stylesheet(const StyleSheet& sheet, Origin origin) {
     }
 }
 
-ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node, const ComputedStyle& parent) {
+ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node,
+                                     const ComputedStyle& parent,
+                                     PseudoElement pseudo) {
     ComputedStyle style = ComputedStyle::initial();
     // Inherit inherited properties + custom properties from the parent.
     style.color = parent.color;
@@ -758,15 +779,19 @@ ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node, con
     std::vector<CascadeEntry> entries;
     // SVG presentation attributes participate at author origin with zero
     // specificity, below stylesheet rules and inline style.
-    if (const NodeCore* c = doc.core(node)) {
-        for (const auto& [name, value] : c->attributes) {
-            if (name == u"fill") {
-                apply_property(style, parent, u"fill", value);
-                break;
+    if (pseudo == PseudoElement::None) {
+        const NodeCore* c = doc.core(node);
+        if (c) {
+            for (const auto& [name, value] : c->attributes) {
+                if (name == u"fill") {
+                    apply_property(style, parent, u"fill", value);
+                    break;
+                }
             }
         }
     }
     for (const MatchableRule& mr : rules_) {
+        if (mr.selector.pseudo_element != pseudo) continue;
         if (!mr.rule->media.empty() && !media_matches(mr.rule->media, viewport_w_, viewport_h_)) continue;
         if (matches(doc, node, mr.selector)) {
             for (const Declaration& d : mr.rule->declarations)
@@ -775,13 +800,17 @@ ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node, con
     }
     // Inline style attribute (highest origin).
     std::vector<Declaration> inline_decls;
-    if (const NodeCore* c = doc.core(node)) {
-        for (auto& [k, v] : c->attributes) {
-            if (k == u"style") {
-                std::vector<std::pair<std::u16string, std::u16string>> kv;
-                parse_inline_declarations(v, kv);
-                for (auto& [p, val] : kv) inline_decls.push_back(Declaration{p, val, false, {}});
-                break;
+    if (pseudo == PseudoElement::None) {
+        const NodeCore* c = doc.core(node);
+        if (c) {
+            for (auto& [k, v] : c->attributes) {
+                if (k == u"style") {
+                    std::vector<std::pair<std::u16string, std::u16string>> kv;
+                    parse_inline_declarations(v, kv);
+                    for (auto& [p, val] : kv)
+                        inline_decls.push_back(Declaration{p, val, false, {}});
+                    break;
+                }
             }
         }
     }
@@ -840,7 +869,23 @@ void StyleResolver::resolve_element(Document& doc, malibu::NodeHandle node, cons
     if (c->node_type == malibu::dom::kElementNode) {
         pool_.push_back(compute(doc, node, parent));
         ComputedStyle& cs = pool_.back();
-        if (NodeCore* mut = doc.core(node)) mut->computed_style = &cs;
+        if (NodeCore* mut = doc.core(node)) {
+            mut->computed_style = &cs;
+            mut->before_style = nullptr;
+            mut->after_style = nullptr;
+        }
+        ComputedStyle before = compute(doc, node, cs, PseudoElement::Before);
+        if (before.generates_content && before.display != DisplayType::None) {
+            pool_.push_back(std::move(before));
+            if (NodeCore* mut = doc.core(node))
+                mut->before_style = &pool_.back();
+        }
+        ComputedStyle after = compute(doc, node, cs, PseudoElement::After);
+        if (after.generates_content && after.display != DisplayType::None) {
+            pool_.push_back(std::move(after));
+            if (NodeCore* mut = doc.core(node))
+                mut->after_style = &pool_.back();
+        }
         this_style = &cs;
     }
     // Children inherit from this element's style (or the inherited parent for non-elements).
@@ -873,6 +918,15 @@ void StyleResolver::resolve_subtree(Document& doc, malibu::NodeHandle node) {
 const ComputedStyle* StyleResolver::style_for(Document& doc, malibu::NodeHandle node) const {
     const NodeCore* c = doc.core(node);
     return c ? c->computed_style : nullptr;
+}
+
+const ComputedStyle* StyleResolver::pseudo_style_for(
+    Document& doc, malibu::NodeHandle node, PseudoElement pseudo) const {
+    const NodeCore* c = doc.core(node);
+    if (!c) return nullptr;
+    if (pseudo == PseudoElement::Before) return c->before_style;
+    if (pseudo == PseudoElement::After) return c->after_style;
+    return nullptr;
 }
 
 } // namespace malibu::css

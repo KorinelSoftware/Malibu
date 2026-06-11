@@ -87,6 +87,27 @@ TEST(View, RequestInterception) {
     EXPECT_EQ(v.eval_js("document.querySelector('#x').textContent"), "\"intercepted\"");
 }
 
+TEST(View, FetchResolvesRelativeUrlsAndReturnsArrayBuffer) {
+    View v;
+    std::string requested_url;
+    v.set_request_handler(
+        [&](const std::string& url, malibu::network::FetchResponse& out) {
+            requested_url = url;
+            out.status = 200;
+            out.body = {0x00, 0x61, 0x73, 0x6d};
+            return true;
+        });
+    v.load_html(
+        "<script>"
+        "fetch('/assets/module.wasm')"
+        ".then(response => response.arrayBuffer())"
+        ".then(buffer => globalThis.byteLength = buffer.byteLength);"
+        "</script>",
+        "https://example.com/app/index.html");
+    EXPECT_EQ(requested_url, "https://example.com/assets/module.wasm");
+    EXPECT_EQ(v.eval_js("globalThis.byteLength"), "4");
+}
+
 TEST(View, SandboxBlocksNavigation) {
     View v;
     v.set_sandbox(SandboxNoNavigation);
@@ -182,4 +203,29 @@ TEST(View, ReportsUnsupportedModuleScriptsWithoutRunningThemAsClassic) {
     EXPECT_EQ(v.diagnostics()[0].kind, LoadDiagnosticKind::Unsupported);
     EXPECT_EQ(v.eval_js("typeof globalThis.moduleRan"), "\"undefined\"");
     EXPECT_EQ(v.eval_js("globalThis.fallbackRan"), "true");
+}
+
+TEST(View, ReportsStylesheetAndImageResourceFailures) {
+    View v;
+    v.set_request_handler(
+        [](const std::string& url, malibu::network::FetchResponse& out) {
+            if (url.find("broken.png") != std::string::npos) {
+                const std::string invalid = "not an image";
+                out.body.assign(invalid.begin(), invalid.end());
+                out.status = 200;
+                return true;
+            }
+            return false;
+        });
+    v.load_html(
+        "<link rel='stylesheet' href='missing.css'>"
+        "<img src='broken.png'>",
+        "https://example.com/path/page");
+    ASSERT_EQ(v.diagnostics().size(), 2u);
+    EXPECT_EQ(v.diagnostics()[0].kind, LoadDiagnosticKind::Resource);
+    EXPECT_EQ(v.diagnostics()[0].url,
+              "https://example.com/path/missing.css");
+    EXPECT_EQ(v.diagnostics()[1].kind, LoadDiagnosticKind::Resource);
+    EXPECT_EQ(v.diagnostics()[1].url,
+              "https://example.com/path/broken.png");
 }

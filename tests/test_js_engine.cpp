@@ -24,12 +24,19 @@ TEST(JSEngine, ArithmeticAndPrecedence) {
     EXPECT_EQ(run("17 % 5"), "2");
     EXPECT_EQ(run("10 / 4"), "2.5");
     EXPECT_EQ(run("-(3 + 4)"), "-7");
+    EXPECT_EQ(run("5e-324 > 0"), "true");
 }
 
 TEST(JSEngine, VariablesAndAssignment) {
     EXPECT_EQ(run("let x = 5; x += 3; x *= 2; x"), "16");
     EXPECT_EQ(run("const a = 10; const b = 20; a + b"), "30");
     EXPECT_EQ(run("let i = 0; i++; i++; i"), "2");
+    EXPECT_EQ(run("let a = 0; let b = 0; (a = 4, b = 5, a + b)"), "9");
+    EXPECT_EQ(run(
+        "const runtime = {};"
+        "runtime.a = 1, runtime.n = 2, runtime.O = () => 42;"
+        "runtime.O()"),
+        "42");
 }
 
 TEST(JSEngine, Strings) {
@@ -39,6 +46,17 @@ TEST(JSEngine, Strings) {
     EXPECT_EQ(run("'a,b,c'.split(',').length"), "3");
     EXPECT_EQ(run("'hello world'.slice(0, 5)"), "hello");
     EXPECT_EQ(run("'abc'.includes('b')"), "true");
+}
+
+TEST(JSEngine, TaggedTemplatesPreserveCookedAndRawSegments) {
+    EXPECT_EQ(
+        run("function tag(parts, value) {"
+            "  return parts[0] + '|' + parts.raw[0] + '|' + value + '|' +"
+            "         parts[1] + '|' + parts.raw[1];"
+            "}"
+            "tag`line\\n${3}tail`"),
+        "line\n|line\\n|3|tail|tail");
+    EXPECT_EQ(run("String.raw`\\p{Emoji}${'-'}\\d`"), "\\p{Emoji}-\\d");
 }
 
 TEST(JSEngine, FunctionsAndRecursion) {
@@ -65,6 +83,47 @@ TEST(JSEngine, ArraysAndHigherOrder) {
     EXPECT_EQ(run("[1,2,3].includes(2)"), "true");
 }
 
+TEST(JSEngine, LargeArrayLiteralDoesNotExhaustRegisters) {
+    std::string source = "[";
+    for (int i = 0; i < 512; ++i) {
+        if (i != 0) source += ",";
+        source += std::to_string(i);
+    }
+    source += "].length";
+
+    Engine engine;
+    EXPECT_EQ(engine.eval_to_string(source), "512");
+}
+
+TEST(JSEngine, NestedArrayLiteralDoesNotExhaustRegisters) {
+    std::string source = "[";
+    for (int i = 0; i < 254; ++i) {
+        if (i != 0) source += ",";
+        source += "{values:[" + std::to_string(i) + "]}";
+    }
+    source += "][253].values[0]";
+
+    Engine engine;
+    EXPECT_EQ(engine.eval_to_string(source), "253");
+}
+
+TEST(JSEngine, WideCallsAndConstructorsUseArgumentVectors) {
+    std::string args;
+    for (int i = 0; i < 279; ++i) {
+        if (i != 0) args += ",";
+        args += std::to_string(i);
+    }
+
+    Engine engine;
+    EXPECT_EQ(engine.eval_to_string(
+                  "function count(){return arguments.length;} count(" + args + ")"),
+              "279");
+    EXPECT_EQ(engine.eval_to_string(
+                  "function Count(){this.value=arguments.length;}"
+                  "(new Count(" + args + ")).value"),
+              "279");
+}
+
 TEST(JSEngine, Objects) {
     EXPECT_EQ(run("const o = { a: 1, b: 2 }; o.a + o.b"), "3");
     EXPECT_EQ(run("const o = {}; o.x = 42; o.x"), "42");
@@ -76,9 +135,19 @@ TEST(JSEngine, Objects) {
 TEST(JSEngine, ControlFlow) {
     EXPECT_EQ(run("let s = 0; for (let i = 1; i <= 10; i++) s += i; s"), "55");
     EXPECT_EQ(run("let s = 0; let i = 0; while (i < 5) { s += i; i++; } s"), "10");
+    EXPECT_EQ(run("let i = 0; do; while (i++ < 2); i"), "3");
     EXPECT_EQ(run("let s = 0; for (const x of [10, 20, 30]) s += x; s"), "60");
     EXPECT_EQ(run("let r = ''; for (let i = 0; i < 5; i++){ if (i === 2) continue; if (i === 4) break; r += i; } r"), "013");
     EXPECT_EQ(run("let x = 7; x > 5 ? 'big' : 'small'"), "big");
+    EXPECT_EQ(run(
+        "let result = 'running';"
+        "outer: for (let i = 0;"
+        "  (function(){ while(false){} return i < 1; })();"
+        "  i++) {"
+        "  for (;;) { result = 'done'; break outer; }"
+        "}"
+        "result"),
+        "done");
 }
 
 TEST(JSEngine, LogicalAndNullish) {
@@ -89,6 +158,29 @@ TEST(JSEngine, LogicalAndNullish) {
     EXPECT_EQ(run("undefined ?? 42"), "42");
 }
 
+TEST(JSEngine, OptionalChainsShortCircuitAsAUnit) {
+    EXPECT_EQ(run("let source; source?.app.getBuildNumber()"), "undefined");
+    EXPECT_EQ(run(
+        "let source; let calls = 0;"
+        "source?.items[calls++].run(calls++);"
+        "calls"),
+        "0");
+    EXPECT_EQ(run(
+        "const source = { value: 7, get(){ return this.value; } };"
+        "source?.get()"),
+        "7");
+    EXPECT_EQ(run(
+        "let source; let threw = false;"
+        "try { (source?.app).getBuildNumber(); } catch (e) { threw = true; }"
+        "threw"),
+        "true");
+    EXPECT_EQ(run(
+        "const source = { app: undefined }; let threw = false;"
+        "try { source?.app.getBuildNumber(); } catch (e) { threw = true; }"
+        "threw"),
+        "true");
+}
+
 TEST(JSEngine, TryCatchThrow) {
     EXPECT_EQ(run(
         "let result;"
@@ -97,6 +189,7 @@ TEST(JSEngine, TryCatchThrow) {
     EXPECT_EQ(run(
         "function risky(){ throw new Error('bad'); }"
         "let msg; try { risky(); } catch (e) { msg = e.message; } msg"), "bad");
+    EXPECT_EQ(run("String(new Error('bad'))"), "Error: bad");
 }
 
 TEST(JSEngine, TryFinallyRuns) {

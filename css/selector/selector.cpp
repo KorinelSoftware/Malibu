@@ -21,7 +21,9 @@ bool is_name_char(char16_t c) {
 }
 
 // Parses one compound selector starting at i (i advanced past it).
-CompoundSelector parse_compound(std::u16string_view s, size_t& i, Specificity& spec, bool& ok) {
+CompoundSelector parse_compound(std::u16string_view s, size_t& i,
+                                Specificity& spec, bool& ok,
+                                PseudoElement* pseudo_element = nullptr) {
     CompoundSelector comp;
     ok = false;
     auto read_name = [&]() {
@@ -64,9 +66,31 @@ CompoundSelector parse_compound(std::u16string_view s, size_t& i, Specificity& s
         }
         else if (c == u':') {
             ++i;
-            if (i < s.size() && s[i] == u':') { ++i; read_name(); spec.c++; ok = true; continue; }  // pseudo-element
+            if (i < s.size() && s[i] == u':') {
+                ++i;
+                std::u16string name = lower(read_name());
+                if (pseudo_element) {
+                    *pseudo_element = name == u"before" ? PseudoElement::Before
+                                    : name == u"after" ? PseudoElement::After
+                                                       : PseudoElement::Unsupported;
+                }
+                spec.c++;
+                ok = true;
+                continue;
+            }
             PseudoClass pc;
             pc.name = lower(read_name());
+            // CSS2 legacy single-colon spelling for ::before / ::after.
+            if (pc.name == u"before" || pc.name == u"after") {
+                if (pseudo_element) {
+                    *pseudo_element = pc.name == u"before"
+                                          ? PseudoElement::Before
+                                          : PseudoElement::After;
+                }
+                spec.c++;
+                ok = true;
+                continue;
+            }
             if (i < s.size() && s[i] == u'(') {
                 ++i;
                 std::u16string arg;
@@ -105,7 +129,8 @@ ComplexSelector parse_selector(std::u16string_view text) {
         else if (text[i] == u'~') { pending = Combinator::GeneralSibling; ++i; skip_ws(); }
 
         bool ok = false;
-        CompoundSelector comp = parse_compound(text, i, sel.specificity, ok);
+        CompoundSelector comp = parse_compound(
+            text, i, sel.specificity, ok, &sel.pseudo_element);
         if (ok) {
             sel.steps.emplace_back(first ? Combinator::Descendant : pending, std::move(comp));
             first = false;
@@ -114,7 +139,8 @@ ComplexSelector parse_selector(std::u16string_view text) {
             ++i;  // avoid infinite loop on garbage
         }
     }
-    sel.valid = !sel.steps.empty();
+    sel.valid = !sel.steps.empty() &&
+                sel.pseudo_element != PseudoElement::Unsupported;
     return sel;
 }
 

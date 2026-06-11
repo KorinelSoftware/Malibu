@@ -58,6 +58,7 @@ public:
 private:
     LayoutBox*  alloc_box();
     LayoutBox*  build_box(malibu::dom::Document& doc, malibu::NodeHandle node);
+    LayoutBox*  build_generated_box(const malibu::css::ComputedStyle* style);
 
     // Formatting contexts. `cb_width` is the containing block's content width.
     void  layout_block(LayoutBox* box, float cb_width);

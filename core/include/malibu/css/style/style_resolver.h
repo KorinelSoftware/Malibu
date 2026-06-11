@@ -40,6 +40,9 @@ public:
 
     [[nodiscard]] const ComputedStyle* style_for(malibu::dom::Document& doc,
                                                  malibu::NodeHandle node) const;
+    [[nodiscard]] const ComputedStyle* pseudo_style_for(
+        malibu::dom::Document& doc, malibu::NodeHandle node,
+        PseudoElement pseudo) const;
 
     [[nodiscard]] size_t rule_count() const noexcept { return rules_.size(); }
 
@@ -54,7 +57,8 @@ private:
     void resolve_element(malibu::dom::Document& doc, malibu::NodeHandle node,
                          const ComputedStyle& parent);
     ComputedStyle compute(malibu::dom::Document& doc, malibu::NodeHandle node,
-                          const ComputedStyle& parent);
+                          const ComputedStyle& parent,
+                          PseudoElement pseudo = PseudoElement::None);
 
     std::vector<MatchableRule>     rules_;
     std::deque<StyleSheet>         sheets_;   // stable storage for rules_ pointers

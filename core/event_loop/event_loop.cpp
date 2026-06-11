@@ -124,6 +124,47 @@ void EventLoop::run_until_idle(uint64_t max_iterations) {
     }
 }
 
+void EventLoop::run_ready_tasks(uint64_t max_iterations) {
+    drain_microtasks();
+    bool rendered = false;
+    uint64_t iterations = 0;
+    while (!quitting_ && iterations++ < max_iterations) {
+        if (!tasks_.empty()) {
+            Task task = std::move(tasks_.front());
+            tasks_.pop_front();
+            if (task) task();
+            drain_microtasks();
+            continue;
+        }
+
+        int timer_index = next_due_timer();
+        if (timer_index >= 0 &&
+            timers_[static_cast<size_t>(timer_index)].fire_at <= now_ms_) {
+            Timer timer = timers_[static_cast<size_t>(timer_index)];
+            if (timer.interval > 0) {
+                timers_[static_cast<size_t>(timer_index)].fire_at =
+                    now_ms_ + timer.interval;
+            } else {
+                timers_[static_cast<size_t>(timer_index)].active = false;
+            }
+            if (timer.task) timer.task();
+            drain_microtasks();
+            timers_.erase(
+                std::remove_if(timers_.begin(), timers_.end(),
+                               [](const Timer& item) { return !item.active; }),
+                timers_.end());
+            continue;
+        }
+
+        if (!rendered && !anim_callbacks_.empty()) {
+            rendered = true;
+            render_step();
+            continue;
+        }
+        break;
+    }
+}
+
 bool EventLoop::has_pending() const {
     if (!tasks_.empty() || !microtasks_.empty() || !anim_callbacks_.empty()) return true;
     for (const auto& t : timers_) if (t.active) return true;

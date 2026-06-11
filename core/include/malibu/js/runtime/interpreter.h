@@ -61,6 +61,7 @@ public:
     JSString*   new_string(std::u16string s);
     JSObject*   new_object();
     JSArray*    new_array();
+    JSArrayBuffer* new_array_buffer(std::vector<uint8_t> data = {});
     JSMap*      new_map();
     JSSet*      new_set();
     JSFunction* new_native(const std::u16string& name, NativeFn fn, uint32_t arity = 0);

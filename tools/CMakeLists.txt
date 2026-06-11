@@ -14,6 +14,7 @@ target_compile_options(malibu_render_cli PRIVATE -Wall -Wextra -Wpedantic -Werro
 target_link_libraries(malibu_render_cli PRIVATE
     malibu_view
     malibu_image
+    malibu_host_network
 )
 
 # libjpeg/libpng live in the multiarch dir, not always on the default runtime

@@ -57,6 +57,9 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
         float bx = box->x - box->padding[3] - box->border[3];
         float by = box->y - box->padding[0] - box->border[0];
         float bw = box->border_box_width(), bh = box->border_box_height();
+        const float border_radius = s->border_radius_percent > 0
+            ? std::min(bw, bh) * s->border_radius_percent
+            : s->border_radius;
 
         // Drop shadow (drawn first, behind the box).
         if (visible && s->has_box_shadow && s->shadow_color.a > 0) {
@@ -67,7 +70,7 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
             sh.rect.x = bx + s->shadow_x - sp - bl; sh.rect.y = by + s->shadow_y - sp - bl;
             sh.rect.w = bw + 2 * (sp + bl);          sh.rect.h = bh + 2 * (sp + bl);
             sh.rect.background = s->shadow_color;
-            sh.rect.border_radius = s->border_radius + sp + bl;
+            sh.rect.border_radius = border_radius + sp + bl;
             sh.rect.shadow = true; sh.rect.blur = bl;
             ctx.list->add(std::move(sh));
         }
@@ -85,7 +88,7 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
             item.rect.border[2] = box->border[2]; item.rect.border[3] = box->border[3];
             item.rect.border_color = s->border_color;
             for (int k = 0; k < 4; ++k) item.rect.border_colors[k] = s->border_colors[k];
-            item.rect.border_radius = s->border_radius;
+            item.rect.border_radius = border_radius;
             if (s->bg_gradient) { item.rect.gradient = true; item.rect.grad_angle = s->bg_angle; item.rect.grad_stops = s->bg_stops; }
             ctx.list->add(std::move(item));
         }

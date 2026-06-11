@@ -10,32 +10,14 @@
 
 #include "malibu/view/view.h"
 #include "malibu/image/png.h"
+#include "malibu/host/curl_resource_loader.h"
 
-#include <array>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
-
-namespace {
-// Fetches a URL via the system curl (host-side TLS). Returns false on failure.
-bool curl_fetch(const std::string& url, std::vector<uint8_t>& body) {
-    // Reject shell-significant chars (this is a local dev tool, but be safe).
-    for (char c : url) if (c == '\'' || c == '`' || c == '\n' || c == '\\') return false;
-    std::string cmd = "curl -sL --max-time 25 -A "
-        "'Mozilla/5.0 (X11; Linux x86_64) Malibu/0.1' --compressed -- '" + url + "'";
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return false;
-    std::array<char, 65536> buf;
-    size_t n;
-    while ((n = std::fread(buf.data(), 1, buf.size(), p)) > 0)
-        body.insert(body.end(), buf.data(), buf.data() + n);
-    int rc = pclose(p);
-    return rc == 0 && !body.empty();
-}
-}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -54,6 +36,7 @@ int main(int argc, char** argv) {
     bool is_url = input.rfind("http://", 0) == 0 || input.rfind("https://", 0) == 0;
 
     malibu::view::View view;
+    malibu::host::CurlResourceLoader loader;
     view.set_diagnostic_handler([](const malibu::view::LoadDiagnostic& diagnostic) {
         const char* kind = "resource";
         if (diagnostic.kind == malibu::view::LoadDiagnosticKind::Script)
@@ -66,18 +49,31 @@ int main(int argc, char** argv) {
 
     if (is_url) {
         // Host fetches the page + every subresource the engine asks for.
-        view.set_request_handler([](const std::string& url, malibu::network::FetchResponse& out) -> bool {
-            std::vector<uint8_t> body;
-            if (!curl_fetch(url, body)) return false;
-            out.body = std::move(body);
-            out.status = 200;
-            return true;
+        view.set_request_handler([&loader](
+            const std::string& url,
+            malibu::network::FetchResponse& out) -> bool {
+            return loader.fetch(url, out);
         });
-        std::vector<uint8_t> page;
-        if (!curl_fetch(input, page)) { std::fprintf(stderr, "malibu_render: fetch failed: %s\n", input.c_str()); return 1; }
-        std::string html(page.begin(), page.end());
-        if (!view.load_html(html, input)) { std::fprintf(stderr, "malibu_render: load failed\n"); return 1; }
-        std::fprintf(stderr, "malibu_render: fetched %zu bytes from %s\n", page.size(), input.c_str());
+        malibu::network::FetchResponse page;
+        if (!loader.fetch(input, page)) {
+            std::fprintf(stderr, "malibu_render: fetch failed: %s: %s\n",
+                         input.c_str(), loader.last_error().c_str());
+            return 1;
+        }
+        if (page.status >= 400) {
+            std::fprintf(stderr, "malibu_render: HTTP %d: %s\n",
+                         page.status, input.c_str());
+            return 1;
+        }
+        const std::string base = page.url.empty() ? input : page.url;
+        loader.set_referrer(base);
+        std::string html(page.body.begin(), page.body.end());
+        if (!view.load_html(html, base)) {
+            std::fprintf(stderr, "malibu_render: load failed\n");
+            return 1;
+        }
+        std::fprintf(stderr, "malibu_render: fetched %zu bytes from %s\n",
+                     page.body.size(), base.c_str());
     } else {
         std::ifstream f(input, std::ios::binary);
         if (!f) { std::fprintf(stderr, "malibu_render: cannot open %s\n", input.c_str()); return 1; }

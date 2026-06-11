@@ -99,3 +99,19 @@ TEST(Screenshot, SvgDecoderAcceptsLowercaseViewboxFromHtmlDom) {
     }
     EXPECT_GT(opaque_pixels, 2000);
 }
+
+TEST(Screenshot, GeneratedBeforeBoxUsesFlexStaticPosition) {
+    View view;
+    ASSERT_TRUE(view.load_html(
+        "<style>"
+        "body{margin:0}"
+        "#host{position:relative;display:flex;align-items:center;"
+        "justify-content:center;width:100px;height:100px}"
+        "#host::before{content:'';position:absolute;width:40px;height:40px;"
+        "border-radius:50%;background:#d93900}"
+        "</style><div id='host'></div>",
+        "https://example.com/"));
+    auto fb = view.render(120, 120);
+    EXPECT_EQ(fb.at(50, 50), (malibu::render::Color{217, 57, 0, 255}));
+    EXPECT_EQ(fb.at(10, 10), (malibu::render::Color{255, 255, 255, 255}));
+}

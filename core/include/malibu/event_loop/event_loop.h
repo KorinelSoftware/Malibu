@@ -39,6 +39,10 @@ public:
     bool run_one_iteration();
     // Runs until no work remains (or quit()). Capped to avoid runaway intervals.
     void run_until_idle(uint64_t max_iterations = 1'000'000);
+    // Runs only work ready at the current clock value. Unlike run_until_idle(),
+    // this never advances time to a future timer and therefore returns when a
+    // page owns a persistent interval.
+    void run_ready_tasks(uint64_t max_iterations = 10'000);
     void drain_microtasks();
     void render_step();
     void quit() { quitting_ = true; }

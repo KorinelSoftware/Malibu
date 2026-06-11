@@ -105,6 +105,12 @@ void Interpreter::remove_host_root(Value v) {
 JSString*   Interpreter::new_string(std::u16string s) { return heap_.alloc<JSString>(std::move(s)); }
 JSObject*   Interpreter::new_object() { auto* o = heap_.alloc<JSObject>(); o->proto = object_proto_; return o; }
 JSArray*    Interpreter::new_array()  { auto* a = heap_.alloc<JSArray>(); a->proto = array_proto_; return a; }
+JSArrayBuffer* Interpreter::new_array_buffer(std::vector<uint8_t> data) {
+    auto* buffer = heap_.alloc<JSArrayBuffer>();
+    buffer->proto = array_buffer_proto_;
+    buffer->data = std::move(data);
+    return buffer;
+}
 JSMap*      Interpreter::new_map()    { auto* m = heap_.alloc<JSMap>(); m->proto = map_proto_; return m; }
 JSSet*      Interpreter::new_set()    { auto* s = heap_.alloc<JSSet>(); s->proto = set_proto_; return s; }
 Value       Interpreter::str(const std::string& s) { return Value::make_heap_ptr(new_string(u16(s))); }
@@ -185,7 +191,18 @@ std::u16string Interpreter::to_string(Value v) {
                 return u"function " + f->name + u"() { [code] }";
             }
             case HeapObject::kDomNodeRef: return u"[object Node]";
-            default: return u"[object Object]";
+            default: {
+                for (const char16_t* method_name : {u"toString", u"valueOf"}) {
+                    Value method = get_prop(v, method_name);
+                    if (!is_callable(method)) continue;
+                    std::vector<Value> args;
+                    Value primitive = call(method, v, args);
+                    if (!primitive.is_heap_ptr() ||
+                        primitive.as_heap_ptr()->kind == HeapObject::kJSString)
+                        return to_string(primitive);
+                }
+                throw_error(u"TypeError", u"Cannot convert object to primitive value");
+            }
         }
     }
     return u"undefined";

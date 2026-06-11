@@ -28,6 +28,62 @@ TEST(Parser, ParsesMemberAndCallChains) {
     ASSERT_NE(r.program, nullptr);
 }
 
+TEST(Parser, ParsesAsyncObjectMethods) {
+    Parser p;
+    auto r = p.parse(
+        "const service = {"
+        "  async snapshot(value) { await save(value); },"
+        "  async *stream() { yield 1; },"
+        "  async() { return 'plain method named async'; },"
+        "  async: 42"
+        "};",
+        "async-object-methods.js");
+    EXPECT_TRUE(r.ok());
+    ASSERT_NE(r.program, nullptr);
+}
+
+TEST(Parser, ParsesTaggedTemplates) {
+    Parser p;
+    auto r = p.parse(
+        "const pattern = String.raw`\\p{Emoji}${suffix}`;"
+        "const result = tag`before ${value} after`;",
+        "tagged-templates.js");
+    EXPECT_TRUE(r.ok());
+    ASSERT_NE(r.program, nullptr);
+}
+
+TEST(Parser, PreservesEmptyDoWhileBody) {
+    Parser p;
+    auto r = p.parse("let i = 0; do; while (i++ < 2);", "empty-do-while.js");
+    ASSERT_TRUE(r.ok());
+    ASSERT_NE(r.program, nullptr);
+    ASSERT_EQ(r.program->children.size(), 2u);
+    const Node& loop = *r.program->children[1];
+    ASSERT_EQ(loop.kind, NodeKind::DoWhile);
+    ASSERT_EQ(loop.children.size(), 2u);
+    EXPECT_EQ(loop.children[0]->kind, NodeKind::Block);
+}
+
+TEST(Parser, PreservesSequenceExpressions) {
+    Parser p;
+    auto r = p.parse("state.a = 1, state.b = 2, state.ready = true;", "sequence.js");
+    ASSERT_TRUE(r.ok());
+    ASSERT_NE(r.program, nullptr);
+    ASSERT_EQ(r.program->children.size(), 1u);
+    const Node& statement = *r.program->children[0];
+    ASSERT_EQ(statement.kind, NodeKind::ExpressionStatement);
+    ASSERT_EQ(statement.children.size(), 1u);
+    EXPECT_EQ(statement.children[0]->kind, NodeKind::Sequence);
+    EXPECT_EQ(statement.children[0]->children.size(), 3u);
+}
+
+TEST(Parser, WrapsContinuousOptionalChains) {
+    Parser p;
+    auto r = p.parse("const value = source?.app.getBuildNumber();", "optional-chain.js");
+    ASSERT_TRUE(r.ok());
+    ASSERT_NE(r.program, nullptr);
+}
+
 TEST(Parser, ReportsSyntaxErrorWithLocationAndNoProgram) {
     Parser p;
     // Missing closing paren on line 3.

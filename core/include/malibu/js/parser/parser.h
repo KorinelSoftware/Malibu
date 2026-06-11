@@ -61,10 +61,10 @@ enum class NodeKind : uint8_t {
     // expressions
     Identifier,
     NumberLiteral, StringLiteral, BoolLiteral, NullLiteral, UndefinedLiteral,
-    TemplateLiteral,
+    TemplateLiteral, TaggedTemplate,
     ArrayLiteral, ObjectLiteral,
-    Member, Call, New,
-    Unary, Binary, Logical, Assignment, Conditional,
+    Member, Call, New, OptionalChain,
+    Unary, Binary, Logical, Assignment, Conditional, Sequence,
     Await, Yield,
     Spread,
 };
@@ -89,6 +89,8 @@ struct Node {
     uint32_t                            column = 0;
     bool                                is_async = false;  // async function / arrow
     uint8_t                             flags    = 0;      // node_flags::* (class members, patterns)
+    std::vector<std::string>            template_raw;     // tagged-template source segments
+    std::vector<std::string>            template_cooked;  // tagged-template decoded segments
 
     explicit Node(NodeKind k) : kind(k) {}
 };

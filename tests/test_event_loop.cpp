@@ -87,3 +87,16 @@ TEST(EventLoop, IntervalRepeatsUntilCleared) {
     loop.run_until_idle();
     EXPECT_EQ(count, 3);
 }
+
+TEST(EventLoop, ReadyPumpDoesNotDrainPersistentIntervals) {
+    EventLoop loop;
+    int count = 0;
+    loop.set_interval([&] { ++count; }, 5);
+
+    loop.run_ready_tasks();
+    EXPECT_EQ(count, 0);
+    loop.advance_clock(5);
+    loop.run_ready_tasks();
+    EXPECT_EQ(count, 1);
+    EXPECT_TRUE(loop.has_pending());
+}

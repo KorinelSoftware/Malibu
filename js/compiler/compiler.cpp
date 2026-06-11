@@ -6,6 +6,7 @@
 #include "malibu/js/bytecode/bytecode.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <set>
 #include <stdexcept>
@@ -31,7 +32,9 @@ double parse_number_literal(const std::string& raw) {
             return static_cast<double>(std::stoll(s.substr(2), nullptr, 2));
         if (s.size() > 2 && s[0] == '0' && (s[1] == 'o' || s[1] == 'O'))
             return static_cast<double>(std::stoll(s.substr(2), nullptr, 8));
-        return std::stod(s);
+        char* end = nullptr;
+        double value = std::strtod(s.c_str(), &end);
+        return end == s.c_str() ? 0.0 : value;
     } catch (...) { return 0.0; }
 }
 
@@ -107,22 +110,22 @@ private:
     }
     void free_to(int mark) { cur_->reg_top = mark; }
 
-    std::string pending_label_;  // label attached to the next loop/switch, if any
-    void push_loop(bool is_switch = false) {
+    void push_loop(bool is_switch = false, std::string label = {}) {
         cur_->loops.push_back(LoopCtx{});
         cur_->loops.back().is_switch = is_switch;
-        cur_->loops.back().label = pending_label_;
-        pending_label_.clear();
+        cur_->loops.back().label = std::move(label);
     }
     void compile_labeled(const Node& n) {
         if (n.children.empty()) return;
         const Node& inner = *n.children[0];
-        NodeKind k = inner.kind;
-        if (k == NodeKind::For || k == NodeKind::While || k == NodeKind::DoWhile ||
-            k == NodeKind::Switch) {
-            pending_label_ = n.str;   // consumed by the loop/switch when it pushes
-            compile_stmt(inner);
-            pending_label_.clear();
+        if (inner.kind == NodeKind::For) {
+            compile_for(inner, n.str);
+        } else if (inner.kind == NodeKind::While) {
+            compile_while(inner, n.str);
+        } else if (inner.kind == NodeKind::DoWhile) {
+            compile_do_while(inner, n.str);
+        } else if (inner.kind == NodeKind::Switch) {
+            compile_switch(inner, n.str);
         } else {
             // Labeled block (or any other statement): a break-only target.
             cur_->loops.push_back(LoopCtx{});
@@ -519,13 +522,13 @@ private:
         }
     }
 
-    void compile_while(const Node& n) {
+    void compile_while(const Node& n, std::string label = {}) {
         int start = here();
         uint8_t c = alloc();
         compile_expr(*n.children[0], c);
         int jexit = emit(OpCode::JumpIfFalse, 0, c, 0, 0);
         free_to(cur_->reg_top - 1);
-        push_loop();
+        push_loop(false, std::move(label));
         if (n.children.size() > 1) compile_stmt(*n.children[1]);
         emit(OpCode::Jump, 0, 0, 0, static_cast<int16_t>(start));
         LoopCtx lc = std::move(cur_->loops.back()); cur_->loops.pop_back();
@@ -544,9 +547,9 @@ private:
         emit(OpCode::PopScope, 0, 0, 0, 0);
     }
 
-    void compile_do_while(const Node& n) {
+    void compile_do_while(const Node& n, std::string label = {}) {
         int start = here();
-        push_loop();
+        push_loop(false, std::move(label));
         compile_stmt(*n.children[0]);
         int cont = here();
         uint8_t c = alloc();
@@ -558,8 +561,11 @@ private:
         for (int j : lc.continue_jumps) patch_imm(j, cont);
     }
 
-    void compile_for(const Node& n) {
-        if (n.str == "of" || n.str == "in") { compile_for_each(n); return; }
+    void compile_for(const Node& n, std::string label = {}) {
+        if (n.str == "of" || n.str == "in") {
+            compile_for_each(n, std::move(label));
+            return;
+        }
         // C-style: children = [init, cond, update, body]
         emit(OpCode::PushScope, 0, 0, 0, 0);
         const Node& init = *n.children[0];
@@ -575,7 +581,7 @@ private:
             jexit = emit(OpCode::JumpIfFalse, 0, c, 0, 0);
             free_to(cur_->reg_top - 1);
         }
-        push_loop();
+        push_loop(false, std::move(label));
         compile_stmt(*n.children[3]);
         int cont = here();
         const Node& upd = *n.children[2];
@@ -588,7 +594,7 @@ private:
         emit(OpCode::PopScope, 0, 0, 0, 0);
     }
 
-    void compile_for_each(const Node& n) {
+    void compile_for_each(const Node& n, std::string label = {}) {
         // children = [binding, iterable, body]; n.str = "of" | "in"
         emit(OpCode::PushScope, 0, 0, 0, 0);
         const Node& binding = *n.children[0];
@@ -624,7 +630,7 @@ private:
         bind_pattern_or_target(*target, r_elem, declare, is_var_decl);
         free_to(r_elem);
 
-        push_loop();
+        push_loop(false, std::move(label));
         compile_stmt(*n.children[2]);
         emit(OpCode::PopScope, 0, 0, 0, 0);
         int cont = here();
@@ -645,7 +651,7 @@ private:
     // switch (disc) { case t: ... default: ... }
     //   children[0] = discriminant; children[1..] = clauses (Block nodes whose
     //   str is "case" (children[0]=test, rest=stmts) or "default" (children=stmts)).
-    void compile_switch(const Node& n) {
+    void compile_switch(const Node& n, std::string label = {}) {
         emit(OpCode::PushScope, 0, 0, 0, 0);
         uint8_t rd = alloc();
         compile_expr(*n.children[0], rd);
@@ -669,7 +675,7 @@ private:
         // No case matched: jump to default body (if any) or past the switch.
         int jdefault = emit(OpCode::Jump, 0, 0, 0, 0);
 
-        push_loop(/*is_switch*/true);
+        push_loop(/*is_switch*/true, std::move(label));
 
         // Emit clause bodies in order (fall-through is natural).
         std::vector<int> body_pcs(clauses.size());
@@ -781,6 +787,8 @@ private:
             case NodeKind::ObjectLiteral: compile_object(n, dst); break;
             case NodeKind::Member: compile_member_get(n, dst); break;
             case NodeKind::Call: compile_call(n, dst); break;
+            case NodeKind::OptionalChain: compile_optional_chain(n, dst); break;
+            case NodeKind::TaggedTemplate: compile_tagged_template(n, dst); break;
             case NodeKind::New: compile_new(n, dst); break;
             case NodeKind::FunctionDeclaration:
             case NodeKind::ArrowFunction: compile_closure_expr(n, dst); break;
@@ -790,6 +798,13 @@ private:
             case NodeKind::Logical: compile_logical(n, dst); break;
             case NodeKind::Assignment: compile_assignment(n, dst); break;
             case NodeKind::Conditional: compile_conditional(n, dst); break;
+            case NodeKind::Sequence:
+                if (n.children.empty()) {
+                    emit(OpCode::LoadUndefined, dst, 0, 0, 0);
+                } else {
+                    for (auto& expression : n.children) compile_expr(*expression, dst);
+                }
+                break;
             case NodeKind::Await: {
                 if (n.children.empty()) { emit(OpCode::LoadUndefined, dst, 0, 0, 0); break; }
                 if (cur_->is_async) {
@@ -814,26 +829,15 @@ private:
     }
 
     void compile_array(const Node& n, uint8_t dst) {
-        bool has_spread = false;
-        for (auto& c : n.children) if (c->kind == NodeKind::Spread) { has_spread = true; break; }
-        if (has_spread) {
-            emit(OpCode::NewArray, dst, 0, 0, 0);  // empty; append element-by-element
-            for (auto& c : n.children) {
-                int m = cur_->reg_top;
-                uint8_t r = alloc();
-                bool spread = c->kind == NodeKind::Spread;
-                compile_expr(spread ? *c->children[0] : *c, r);
-                emit(OpCode::ArrayAppend, dst, r, 0, spread ? 1 : 0);
-                free_to(m);
-            }
-            return;
+        emit(OpCode::NewArray, dst, 0, 0, 0);
+        for (auto& c : n.children) {
+            int mark = cur_->reg_top;
+            uint8_t value = alloc();
+            bool spread = c->kind == NodeKind::Spread;
+            compile_expr(spread ? *c->children[0] : *c, value);
+            emit(OpCode::ArrayAppend, dst, value, 0, spread ? 1 : 0);
+            free_to(mark);
         }
-        int count = static_cast<int>(n.children.size());
-        int mark = cur_->reg_top;
-        int base = alloc_block(count);
-        for (int i = 0; i < count; ++i) compile_expr(*n.children[i], static_cast<uint8_t>(base + i));
-        emit(OpCode::NewArray, dst, static_cast<uint16_t>(base), 0, static_cast<int16_t>(count));
-        free_to(mark);
     }
 
     void compile_object(const Node& n, uint8_t dst) {
@@ -874,6 +878,116 @@ private:
     // `super` only ever appears as the object of a Member or callee of a Call.
     static bool is_super(const Node& n) {
         return n.kind == NodeKind::Identifier && n.str == "super";
+    }
+
+    void emit_optional_guard(uint8_t value, std::vector<int>& short_circuits) {
+        int mark = cur_->reg_top;
+        uint8_t null_value = alloc();
+        emit(OpCode::LoadNull, null_value, 0, 0, 0);
+        uint8_t is_nullish = alloc();
+        emit(OpCode::Eq, is_nullish, value, null_value, 0);
+        short_circuits.push_back(emit(OpCode::JumpIfTrue, 0, is_nullish, 0, 0));
+        free_to(mark);
+    }
+
+    void compile_optional_chain_link(const Node& n, uint8_t dst,
+                                     std::vector<int>& short_circuits) {
+        if (n.kind == NodeKind::Member) {
+            int mark = cur_->reg_top;
+            uint8_t object = alloc();
+            compile_optional_chain_link(*n.children[0], object, short_circuits);
+            if (n.flags & parser::node_flags::Optional)
+                emit_optional_guard(object, short_circuits);
+            if (n.str == "[]") {
+                uint8_t key = alloc();
+                compile_expr(*n.children[1], key);
+                emit(OpCode::GetElem, dst, object, key, 0);
+            } else {
+                emit(OpCode::GetProp, dst, object, 0,
+                     static_cast<int16_t>(str_const(u16(n.str))));
+            }
+            free_to(mark);
+            return;
+        }
+
+        if (n.kind == NodeKind::Call) {
+            const Node& callee_node = *n.children[0];
+            int argc = static_cast<int>(n.children.size()) - 1;
+            int mark = cur_->reg_top;
+            uint8_t callee = alloc();
+            uint8_t this_value = alloc();
+
+            if (callee_node.kind == NodeKind::Member) {
+                compile_optional_chain_link(
+                    *callee_node.children[0], this_value, short_circuits);
+                if (callee_node.flags & parser::node_flags::Optional)
+                    emit_optional_guard(this_value, short_circuits);
+                if (callee_node.str == "[]") {
+                    int key_mark = cur_->reg_top;
+                    uint8_t key = alloc();
+                    compile_expr(*callee_node.children[1], key);
+                    emit(OpCode::GetElem, callee, this_value, key, 0);
+                    free_to(key_mark);
+                } else {
+                    emit(OpCode::GetProp, callee, this_value, 0,
+                         static_cast<int16_t>(str_const(u16(callee_node.str))));
+                }
+            } else {
+                compile_optional_chain_link(callee_node, callee, short_circuits);
+                emit(OpCode::LoadUndefined, this_value, 0, 0, 0);
+            }
+
+            if (n.flags & parser::node_flags::Optional)
+                emit_optional_guard(callee, short_circuits);
+
+            bool has_spread = false;
+            for (int i = 1; i <= argc; ++i) {
+                if (n.children[i]->kind == NodeKind::Spread) {
+                    has_spread = true;
+                    break;
+                }
+            }
+            constexpr int kMaxDirectCallArguments = 64;
+            bool use_argument_vector =
+                has_spread || argc > kMaxDirectCallArguments ||
+                cur_->reg_top + 2 + argc > 256;
+            if (use_argument_vector) {
+                uint8_t args_array = alloc();
+                build_args_array(args_array, n, 1);
+                emit(OpCode::CallV, dst, callee, this_value,
+                     static_cast<int16_t>(args_array));
+            } else {
+                int base = alloc_block(2 + argc);
+                emit(OpCode::Move, static_cast<uint8_t>(base), callee, 0, 0);
+                emit(OpCode::Move, static_cast<uint8_t>(base + 1), this_value, 0, 0);
+                for (int i = 0; i < argc; ++i)
+                    compile_expr(*n.children[i + 1],
+                                 static_cast<uint8_t>(base + 2 + i));
+                emit(OpCode::Call, dst, static_cast<uint16_t>(base), 0,
+                     static_cast<int16_t>(argc));
+            }
+            free_to(mark);
+            return;
+        }
+
+        compile_expr(n, dst);
+    }
+
+    void compile_optional_chain(const Node& n, uint8_t dst) {
+        if (n.children.empty()) {
+            emit(OpCode::LoadUndefined, dst, 0, 0, 0);
+            return;
+        }
+
+        std::vector<int> short_circuits;
+        compile_optional_chain_link(*n.children[0], dst, short_circuits);
+        if (short_circuits.empty()) return;
+
+        int completed = emit(OpCode::Jump, 0, 0, 0, 0);
+        int nullish = here();
+        emit(OpCode::LoadUndefined, dst, 0, 0, 0);
+        for (int jump : short_circuits) patch_imm(jump, nullish);
+        patch_imm(completed, here());
     }
 
     void compile_member_get(const Node& n, uint8_t dst) {
@@ -997,11 +1111,17 @@ private:
             return;
         }
 
-        // Argument spread: f(a, ...xs, b) — collect into an array and CallV.
+        // Spread and wide calls use a dynamic argument vector. Keeping a
+        // bounded direct-call frame leaves registers available while compiling
+        // nested argument expressions.
         bool has_spread = false;
         for (int i = 1; i <= argc; ++i)
             if (n.children[i]->kind == NodeKind::Spread) { has_spread = true; break; }
-        if (has_spread) {
+        constexpr int kMaxDirectCallArguments = 64;
+        bool use_argument_vector =
+            has_spread || argc > kMaxDirectCallArguments ||
+            cur_->reg_top + 2 + argc > 256;
+        if (use_argument_vector) {
             uint8_t calleeReg = alloc();
             uint8_t thisReg = alloc();
             if (callee.kind == NodeKind::Member) {
@@ -1051,6 +1171,66 @@ private:
         free_to(mark);
     }
 
+    void compile_tagged_template(const Node& n, uint8_t dst) {
+        if (n.children.empty()) {
+            emit(OpCode::LoadUndefined, dst, 0, 0, 0);
+            return;
+        }
+
+        const Node& callee = *n.children[0];
+        int substitutions = static_cast<int>(n.children.size()) - 1;
+        int argc = substitutions + 1;
+        int mark = cur_->reg_top;
+        int base = alloc_block(2 + argc);  // [callee][this][template][substitutions...]
+
+        if (callee.kind == NodeKind::Member) {
+            uint8_t receiver = static_cast<uint8_t>(base + 1);
+            compile_expr(*callee.children[0], receiver);
+            if (callee.str == "[]") {
+                int member_mark = cur_->reg_top;
+                uint8_t key = alloc();
+                compile_expr(*callee.children[1], key);
+                emit(OpCode::GetElem, static_cast<uint8_t>(base), receiver, key, 0);
+                free_to(member_mark);
+            } else {
+                emit(OpCode::GetProp, static_cast<uint8_t>(base), receiver, 0,
+                     static_cast<int16_t>(str_const(u16(callee.str))));
+            }
+        } else {
+            compile_expr(callee, static_cast<uint8_t>(base));
+            emit(OpCode::LoadUndefined, static_cast<uint8_t>(base + 1), 0, 0, 0);
+        }
+
+        uint8_t template_object = static_cast<uint8_t>(base + 2);
+        int segment_count = static_cast<int>(n.template_cooked.size());
+        int cooked_base = alloc_block(segment_count);
+        for (int i = 0; i < segment_count; ++i) {
+            emit(OpCode::LoadString, static_cast<uint8_t>(cooked_base + i), 0, 0,
+                 static_cast<int16_t>(str_const(u16(n.template_cooked[i]))));
+        }
+        emit(OpCode::NewArray, template_object, static_cast<uint16_t>(cooked_base), 0,
+             static_cast<int16_t>(segment_count));
+        free_to(cooked_base);
+
+        uint8_t raw_array = alloc();
+        int raw_base = alloc_block(static_cast<int>(n.template_raw.size()));
+        for (int i = 0; i < static_cast<int>(n.template_raw.size()); ++i) {
+            emit(OpCode::LoadString, static_cast<uint8_t>(raw_base + i), 0, 0,
+                 static_cast<int16_t>(str_const(u16(n.template_raw[i]))));
+        }
+        emit(OpCode::NewArray, raw_array, static_cast<uint16_t>(raw_base), 0,
+             static_cast<int16_t>(n.template_raw.size()));
+        free_to(raw_base);
+        emit(OpCode::SetProp, template_object, raw_array, 0,
+             static_cast<int16_t>(str_const(u"raw")));
+
+        for (int i = 0; i < substitutions; ++i)
+            compile_expr(*n.children[i + 1], static_cast<uint8_t>(base + 3 + i));
+
+        emit(OpCode::Call, dst, static_cast<uint16_t>(base), 0, static_cast<int16_t>(argc));
+        free_to(mark);
+    }
+
     void compile_new(const Node& n, uint8_t dst) {
         const Node* callee = n.children.empty() ? nullptr : n.children[0].get();
         std::vector<const Node*> args;
@@ -1063,7 +1243,11 @@ private:
 
         bool has_spread = false;
         for (const Node* a : args) if (a->kind == NodeKind::Spread) { has_spread = true; break; }
-        if (has_spread) {
+        constexpr int kMaxDirectConstructArguments = 64;
+        bool use_argument_vector =
+            has_spread || argc > kMaxDirectConstructArguments ||
+            cur_->reg_top + 1 + argc > 256;
+        if (use_argument_vector) {
             uint8_t calleeReg = alloc();
             if (callee) compile_expr(*callee, calleeReg);
             else emit(OpCode::LoadUndefined, calleeReg, 0, 0, 0);

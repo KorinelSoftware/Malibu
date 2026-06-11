@@ -44,6 +44,17 @@ TEST(CSSSelector, Specificity) {
     EXPECT_TRUE(a < b);
 }
 
+TEST(CSSSelector, PreservesBeforeAndAfterPseudoElements) {
+    auto before = parse_selector(u"main::before");
+    auto after = parse_selector(u".item:after");
+    EXPECT_TRUE(before.valid);
+    EXPECT_TRUE(after.valid);
+    EXPECT_EQ(before.pseudo_element, PseudoElement::Before);
+    EXPECT_EQ(after.pseudo_element, PseudoElement::After);
+    EXPECT_EQ(before.specificity, (Specificity{0, 0, 2}));
+    EXPECT_EQ(after.specificity, (Specificity{0, 1, 1}));
+}
+
 namespace {
 // Build: <body><div id=app class=box><p>text</p></div></body>
 struct Tree {
@@ -108,6 +119,26 @@ TEST(CSSStyle, SvgFillCascadesAndResolvesCurrentColor) {
               (Color{255, 69, 0, 255}));
     EXPECT_EQ(r.style_for(t.doc, t.p)->svg_fill,
               (Color{255, 255, 255, 255}));
+}
+
+TEST(CSSStyle, PseudoElementStyleDoesNotLeakOntoOriginatingElement) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u"#app { background-color: blue; }"
+        u"#app::before { content:''; background-color:red; "
+        u"position:absolute; width:20px; height:20px; }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    const ComputedStyle* normal = r.style_for(t.doc, t.div);
+    const ComputedStyle* before =
+        r.pseudo_style_for(t.doc, t.div, PseudoElement::Before);
+    ASSERT_NE(normal, nullptr);
+    ASSERT_NE(before, nullptr);
+    EXPECT_EQ(normal->background_color, (Color{0, 0, 255, 255}));
+    EXPECT_EQ(before->background_color, (Color{255, 0, 0, 255}));
+    EXPECT_TRUE(before->generates_content);
 }
 
 TEST(CSSStyle, VarResolvesFromNearestAncestor) {

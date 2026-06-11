@@ -844,7 +844,8 @@ private:
         auto cond = parse_expression(); if (failed_) return nullptr;
         if (!expect_punct(")")) return nullptr;
         accept_punct(";");
-        if (body) n->children.push_back(std::move(body));
+        if (!body) body = mk(NodeKind::Block);
+        n->children.push_back(std::move(body));
         n->children.push_back(std::move(cond));
         return n;
     }
@@ -987,13 +988,17 @@ private:
     NodePtr parse_expression() {
         auto first = parse_assignment();
         if (failed_) return nullptr;
+        if (!is_punct(",")) return first;
+
+        auto sequence = std::make_unique<Node>(NodeKind::Sequence);
+        if (first) sequence->children.push_back(std::move(first));
         while (is_punct(",")) {
             advance();
             auto next = parse_assignment();
             if (failed_) return nullptr;
-            (void)next; // sequence expr: keep leftmost for our purposes
+            if (next) sequence->children.push_back(std::move(next));
         }
-        return first;
+        return sequence;
     }
 
     NodePtr parse_assignment() {
@@ -1173,10 +1178,12 @@ private:
 
     NodePtr parse_member_chain(NodePtr base, bool allow_call = true) {
         if (failed_) return nullptr;
+        bool saw_optional = false;
         while (true) {
             if (!allow_call && is_punct("(")) break;  // `new` callee: stop before args
             // Optional chaining: ?.name / ?.[expr] / ?.(args)
             if (is_punct("?.")) {
+                saw_optional = true;
                 advance();
                 if (is_punct("(")) {  // optional call
                     auto call = std::make_unique<Node>(NodeKind::Call);
@@ -1226,9 +1233,18 @@ private:
                 if (base) call->children.push_back(std::move(base));
                 if (!parse_arguments(*call)) return nullptr;
                 base = std::move(call);
+            } else if (cur().type == TokenType::TemplateLiteral) {
+                std::string raw = advance().value;
+                base = build_tagged_template(std::move(base), raw);
+                if (failed_) return nullptr;
             } else {
                 break;
             }
+        }
+        if (saw_optional) {
+            auto chain = std::make_unique<Node>(NodeKind::OptionalChain);
+            if (base) chain->children.push_back(std::move(base));
+            return chain;
         }
         return base;
     }
@@ -1338,6 +1354,24 @@ private:
             }
             std::string key;
             bool computed = false;
+            bool is_async_method = false;
+            if (cur().value == "async" &&
+                (cur().type == TokenType::Identifier ||
+                 cur().type == TokenType::Keyword)) {
+                const Token& next = peek();
+                const bool same_line = cur().line == next.line;
+                const bool followed_by_key =
+                    next.type == TokenType::Identifier ||
+                    next.type == TokenType::Keyword ||
+                    next.type == TokenType::StringLiteral ||
+                    next.type == TokenType::NumberLiteral ||
+                    (next.type == TokenType::Punctuator &&
+                     (next.value == "[" || next.value == "*"));
+                if (same_line && followed_by_key) {
+                    advance();
+                    is_async_method = true;
+                }
+            }
             // get/set accessor: `get name(){}` / `set name(v){}` — but NOT when
             // `get`/`set` is itself the key (`{get: 1}`, `{get(){}}`).
             uint8_t accessor_flag = 0;
@@ -1378,11 +1412,16 @@ private:
             } else if (is_punct("(")) {
                 // method shorthand: key() { ... }
                 auto fn = std::make_unique<Node>(NodeKind::FunctionDeclaration);
+                fn->is_async = is_async_method;
                 if (is_gen_method) fn->flags |= node_flags::Generator;
                 if (!parse_param_list(*fn)) return nullptr;
                 auto body = parse_block(); if (failed_) return nullptr; if (body) fn->children.push_back(std::move(body));
                 prop->children.push_back(std::move(fn));
             } else {
+                if (is_async_method) {
+                    fail("expected '(' after async method name");
+                    return nullptr;
+                }
                 // shorthand { key } => { key: key }
                 auto id = std::make_unique<Node>(NodeKind::Identifier);
                 id->str = key;
@@ -1467,6 +1506,51 @@ private:
         }
         flush();
         return expr ? std::move(expr) : [&]{ auto sn = std::make_unique<Node>(NodeKind::StringLiteral); sn->str = ""; return sn; }();
+    }
+
+    static std::string cook_template_segment(const std::string& raw) {
+        std::string cooked;
+        for (size_t i = 0; i < raw.size();) {
+            if (raw[i] == '\\') cooked += cook_escape(raw, i);
+            else cooked += raw[i++];
+        }
+        return cooked;
+    }
+
+    NodePtr build_tagged_template(NodePtr tag, const std::string& raw) {
+        auto n = std::make_unique<Node>(NodeKind::TaggedTemplate);
+        if (tag) n->children.push_back(std::move(tag));
+
+        size_t segment_start = 0;
+        for (size_t i = 0; i < raw.size();) {
+            if (raw[i] == '\\') {
+                i = std::min(i + 2, raw.size());
+                continue;
+            }
+            if (raw[i] != '$' || i + 1 >= raw.size() || raw[i + 1] != '{') {
+                ++i;
+                continue;
+            }
+
+            std::string segment = raw.substr(segment_start, i - segment_start);
+            n->template_raw.push_back(segment);
+            n->template_cooked.push_back(cook_template_segment(segment));
+
+            size_t end = skip_interp(raw, i + 2);
+            if (end <= i + 2 || end > raw.size()) {
+                fail("unterminated tagged template interpolation");
+                return nullptr;
+            }
+            size_t inner_len = (end - 1) - (i + 2);
+            n->children.push_back(parse_interp(raw.substr(i + 2, inner_len)));
+            i = end;
+            segment_start = end;
+        }
+
+        std::string segment = raw.substr(segment_start);
+        n->template_raw.push_back(segment);
+        n->template_cooked.push_back(cook_template_segment(segment));
+        return n;
     }
 
     std::vector<Token> toks_;

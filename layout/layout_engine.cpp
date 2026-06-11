@@ -32,6 +32,22 @@ std::pair<float, float> intrinsic_widths(LayoutBox* b, const TextMeasurer* m);  
 bool is_inline_level(BoxType t) {
     return t == BoxType::Inline || t == BoxType::Text || t == BoxType::InlineBlock;
 }
+BoxType box_type_for(DisplayType display) {
+    switch (display) {
+        case DisplayType::Inline:        return BoxType::Inline;
+        case DisplayType::InlineBlock:   return BoxType::InlineBlock;
+        case DisplayType::Flex:
+        case DisplayType::InlineFlex:    return BoxType::Flex;
+        case DisplayType::Table:         return BoxType::Table;
+        case DisplayType::TableRow:      return BoxType::TableRow;
+        case DisplayType::TableCell:     return BoxType::TableCell;
+        case DisplayType::TableRowGroup: return BoxType::TableRowGroup;
+        case DisplayType::ListItem:      return BoxType::ListItem;
+        case DisplayType::Grid:
+        case DisplayType::InlineGrid:    return BoxType::Grid;
+        default:                         return BoxType::Block;
+    }
+}
 std::vector<std::u16string> split_words(const std::u16string& s) {
     std::vector<std::u16string> words;
     std::u16string cur;
@@ -112,20 +128,7 @@ LayoutBox* LayoutEngine::build_box(Document& doc, malibu::NodeHandle node) {
     LayoutBox* box = alloc_box();
     box->node = node;
     box->style = style;
-    switch (d) {
-        case DisplayType::Inline:      box->type = BoxType::Inline; break;
-        case DisplayType::InlineBlock: box->type = BoxType::InlineBlock; break;
-        case DisplayType::Flex:
-        case DisplayType::InlineFlex:  box->type = BoxType::Flex; break;
-        case DisplayType::Table:       box->type = BoxType::Table; break;
-        case DisplayType::TableRow:    box->type = BoxType::TableRow; break;
-        case DisplayType::TableCell:   box->type = BoxType::TableCell; break;
-        case DisplayType::TableRowGroup: box->type = BoxType::TableRowGroup; break;
-        case DisplayType::ListItem:    box->type = BoxType::ListItem; break;
-        case DisplayType::Grid:
-        case DisplayType::InlineGrid:  box->type = BoxType::Grid; break;
-        default:                       box->type = BoxType::Block; break;
-    }
+    box->type = box_type_for(d);
     node_to_box_[key(node)] = box;
 
     // Replaced elements contribute one principal box. Their implementation
@@ -142,11 +145,19 @@ LayoutBox* LayoutEngine::build_box(Document& doc, malibu::NodeHandle node) {
         box->intrinsic_height = it->second.height;
     }
     if (!replaced) {
+        if (LayoutBox* before = build_generated_box(c->before_style)) {
+            before->parent = box;
+            box->children.push_back(before);
+        }
         for (malibu::NodeHandle child : c->children) {
             if (LayoutBox* cb = build_box(doc, child)) {
                 cb->parent = box;
                 box->children.push_back(cb);
             }
+        }
+        if (LayoutBox* after = build_generated_box(c->after_style)) {
+            after->parent = box;
+            box->children.push_back(after);
         }
     }
 
@@ -161,6 +172,26 @@ LayoutBox* LayoutEngine::build_box(Document& doc, malibu::NodeHandle node) {
                 break;
             }
         }
+    }
+    return box;
+}
+
+LayoutBox* LayoutEngine::build_generated_box(const ComputedStyle* style) {
+    if (!style || !style->generates_content ||
+        style->display == DisplayType::None) {
+        return nullptr;
+    }
+    LayoutBox* box = alloc_box();
+    box->node = malibu::NodeHandle::null_handle();
+    box->style = style;
+    box->type = box_type_for(style->display);
+    if (!style->generated_content.empty()) {
+        LayoutBox* text = alloc_box();
+        text->node = malibu::NodeHandle::null_handle();
+        text->type = BoxType::Text;
+        text->text = style->generated_content;
+        text->parent = box;
+        box->children.push_back(text);
     }
     return box;
 }
@@ -366,7 +397,17 @@ void LayoutEngine::layout_flex(LayoutBox* box) {
     JustifyContent justify = s ? s->flex.justify_content : JustifyContent::FlexStart;
 
     std::vector<LayoutBox*> items;
-    for (LayoutBox* c : box->children) if (c->type != BoxType::Text || !c->text.empty()) items.push_back(c);
+    std::vector<LayoutBox*> positioned;
+    for (LayoutBox* c : box->children) {
+        const auto position = c->style ? c->style->position
+                                       : malibu::css::PositionType::Static;
+        if (position == malibu::css::PositionType::Absolute ||
+            position == malibu::css::PositionType::Fixed) {
+            positioned.push_back(c);
+        } else if (c->type != BoxType::Text || !c->text.empty()) {
+            items.push_back(c);
+        }
+    }
 
     // Resolve each item's edges + base main size. For a row, an auto-width item's
     // flex-basis is its max-content (not the full container) — this is the proper
@@ -397,6 +438,73 @@ void LayoutEngine::layout_flex(LayoutBox* box) {
         }
     }
 
+    auto place_positioned = [&]() {
+        auto main_offset = [&](JustifyContent value, float available,
+                               float item_size) {
+            if (value == JustifyContent::FlexEnd)
+                return available - item_size;
+            if (value == JustifyContent::Center ||
+                value == JustifyContent::SpaceAround ||
+                value == JustifyContent::SpaceEvenly)
+                return (available - item_size) / 2.0f;
+            return 0.0f;
+        };
+        auto cross_offset = [&](AlignItems value, float available,
+                                float item_size) {
+            if (value == AlignItems::FlexEnd) return available - item_size;
+            if (value == AlignItems::Center) return (available - item_size) / 2.0f;
+            return 0.0f;
+        };
+        for (LayoutBox* it : positioned) {
+            const ComputedStyle* ps = it->style;
+            if (!ps) continue;
+            const bool fixed = ps->position == malibu::css::PositionType::Fixed;
+            const float cbx = fixed ? 0.0f : box->x;
+            const float cby = fixed ? 0.0f : box->y;
+            const float cbw = fixed ? viewport_w_ : box->width;
+            const float cbh = fixed ? viewport_h_ : box->height;
+            resolve_edges(it, cbw);
+
+            if (!ps->width.is_auto()) {
+                it->width = compute_content_width(it, cbw, viewport_w_, viewport_h_);
+            } else {
+                const float edges = it->margin[1] + it->margin[3] +
+                                    it->border[1] + it->border[3] +
+                                    it->padding[1] + it->padding[3];
+                auto [min_width, max_width] = intrinsic_widths(it, measurer_);
+                (void)min_width;
+                it->width = std::max(0.0f, std::min(cbw - edges,
+                                                   max_width - edges));
+            }
+            layout_box_contents(it);
+
+            const float outer_w = it->margin_box_width();
+            const float outer_h = it->margin_box_height();
+            float outer_x = cbx + (row ? main_offset(justify, cbw, outer_w)
+                                       : cross_offset(align, cbw, outer_w));
+            float outer_y = cby + (row ? cross_offset(align, cbh, outer_h)
+                                       : main_offset(justify, cbh, outer_h));
+            auto resolve_x = [&](const malibu::css::Length& length) {
+                return length.resolve(ps->font_size, cbw, 16.0f,
+                                      viewport_w_, viewport_h_);
+            };
+            auto resolve_y = [&](const malibu::css::Length& length) {
+                return length.resolve(ps->font_size, cbh, 16.0f,
+                                      viewport_w_, viewport_h_);
+            };
+            if (!ps->left.is_auto()) outer_x = cbx + resolve_x(ps->left);
+            else if (!ps->right.is_auto())
+                outer_x = cbx + cbw - resolve_x(ps->right) - outer_w;
+            if (!ps->top.is_auto()) outer_y = cby + resolve_y(ps->top);
+            else if (!ps->bottom.is_auto())
+                outer_y = cby + cbh - resolve_y(ps->bottom) - outer_h;
+
+            it->x = outer_x + it->margin[3] + it->border[3] + it->padding[3];
+            it->y = outer_y + it->margin[0] + it->border[0] + it->padding[0];
+            layout_box_contents(it);
+        }
+    };
+
     // flex-wrap (row): greedily pack items into multiple lines, stacking lines on
     // the cross axis. Items keep their measured sizes (grow/shrink/justify are not
     // applied per line — enough for card/nav grids, the common wrap case).
@@ -414,6 +522,7 @@ void LayoutEngine::layout_flex(LayoutBox* box) {
         }
         float content_h = (y + line_h) - box->y;
         if (!s || s->height.is_auto()) box->height = content_h;
+        place_positioned();
         return;
     }
 
@@ -532,6 +641,7 @@ void LayoutEngine::layout_flex(LayoutBox* box) {
     }
 
     if (!row && !main_definite) box->height = used;  // only auto column boxes grow to content
+    place_positioned();
 }
 
 // Lay out a box's own contents according to its formatting context.

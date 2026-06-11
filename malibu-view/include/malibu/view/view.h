@@ -141,7 +141,7 @@ public:
     [[nodiscard]] uint32_t sandbox() const noexcept { return sandbox_; }
 
     // ---- pump the event loop (timers, promises, rAF) ----
-    void run_tasks() { engine_.run_event_loop(); }
+    void run_tasks(uint64_t elapsed_ms = 0) { engine_.run_ready_tasks(elapsed_ms); }
 
     // ---- accessors (for tests / hosts) ----
     dom::Document&        document() { return *doc_; }

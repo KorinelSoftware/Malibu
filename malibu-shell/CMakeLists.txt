@@ -5,10 +5,9 @@ cmake_minimum_required(VERSION 3.25)
 # which the engine itself never touches (host provides bytes via request_handler).
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 sdl2)
-find_package(CURL)
 
-if(NOT SDL2_FOUND OR NOT CURL_FOUND)
-    message(STATUS "malibu-shell: SDL2 or libcurl not found — skipping the mini-browser")
+if(NOT SDL2_FOUND)
+    message(STATUS "malibu-shell: SDL2 not found — skipping the mini-browser")
     return()
 endif()
 
@@ -20,7 +19,12 @@ target_include_directories(malibu_shell PRIVATE
 target_include_directories(malibu_shell SYSTEM PRIVATE ${SDL2_INCLUDE_DIRS})
 target_compile_features(malibu_shell PRIVATE cxx_std_20)
 target_compile_options(malibu_shell PRIVATE -Wall -Wextra)
-target_link_libraries(malibu_shell PRIVATE malibu_view malibu_image ${SDL2_LIBRARIES} CURL::libcurl)
+target_link_libraries(malibu_shell PRIVATE
+    malibu_view
+    malibu_image
+    malibu_host_network
+    ${SDL2_LIBRARIES}
+)
 target_link_directories(malibu_shell PRIVATE ${SDL2_LIBRARY_DIRS})
 set_target_properties(malibu_shell PROPERTIES OUTPUT_NAME malibu-browser)
 

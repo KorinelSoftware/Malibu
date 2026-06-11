@@ -66,6 +66,8 @@ struct NodeCore {
 
     malibu::JSObjectHandle    wrapper{};       // null until first JS access
     malibu::css::ComputedStyle* computed_style = nullptr;  // owned by CSS Engine
+    malibu::css::ComputedStyle* before_style   = nullptr;  // generated box, not DOM
+    malibu::css::ComputedStyle* after_style    = nullptr;  // generated box, not DOM
     malibu::layout::LayoutBox*  layout_box     = nullptr;  // owned by Layout Engine
 
     // Dynamic interaction state (drives :hover/:focus/:active selectors). Set by

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -102,6 +104,10 @@ bool is_classic_script_type(const std::string& type) {
     return std::any_of(std::begin(kJavaScriptTypes),
                        std::end(kJavaScriptTypes),
                        [&](const char* candidate) { return type == candidate; });
+}
+
+bool is_http_error(const network::FetchResponse& response) {
+    return response.status >= 400;
 }
 }  // namespace
 
@@ -206,7 +212,8 @@ void View::install_view_globals() {
 
     auto* fetch_fn = interp.new_native(u"fetch",
         [self, json_parse](Interpreter& in, Value, std::vector<Value>& a) -> Value {
-            std::string url = a.empty() ? std::string() : narrow(in.to_string(a[0]));
+            std::string requested = a.empty() ? std::string() : narrow(in.to_string(a[0]));
+            std::string url = self->resolve_url(widen(requested));
             JSPromise* p = in.new_promise();
             network::FetchResponse resp;
             bool handled = self->request_handler_ && self->request_handler_(url, resp);
@@ -234,6 +241,13 @@ void View::install_view_globals() {
                                                              : in2.call(json_parse, Value::make_undefined(), pa);
                     in2.resolve_promise(jp, parsed);
                     return Value::make_heap_ptr(jp);
+                })));
+            res->set(u"arrayBuffer", Value::make_heap_ptr(in.new_native(u"arrayBuffer",
+                [bytes = resp.body](Interpreter& in2, Value, std::vector<Value>&) mutable -> Value {
+                    JSPromise* bp = in2.new_promise();
+                    in2.resolve_promise(
+                        bp, Value::make_heap_ptr(in2.new_array_buffer(std::move(bytes))));
+                    return Value::make_heap_ptr(bp);
                 })));
             in.resolve_promise(p, Value::make_heap_ptr(res));
             return Value::make_heap_ptr(p);
@@ -957,11 +971,32 @@ void View::load_images(const malibu::html::ParsedDocument&) {
         return src;
     };
     for (malibu::NodeHandle node : imgs) {
-        if (!request_handler_) continue;
         std::u16string url = pick_url(node);
-        if (url.empty() || url.rfind(u"data:", 0) == 0) continue;
+        if (url.empty()) continue;
+        const std::string resolved = resolve_url(url);
+        if (url.rfind(u"data:", 0) == 0) {
+            record_diagnostic(LoadDiagnosticKind::Unsupported, resolved,
+                              "data URL images are not implemented");
+            continue;
+        }
+        if (!request_handler_) {
+            record_diagnostic(LoadDiagnosticKind::Resource, resolved,
+                              "no resource loader is installed for image");
+            continue;
+        }
         network::FetchResponse resp;
-        if (!request_handler_(resolve_url(url), resp)) continue;
+        if (!request_handler_(resolved, resp)) {
+            record_diagnostic(LoadDiagnosticKind::Resource, resolved,
+                              "failed to fetch image");
+            continue;
+        }
+        if (is_http_error(resp)) {
+            record_diagnostic(
+                LoadDiagnosticKind::Resource, resolved,
+                "image request returned HTTP " +
+                    std::to_string(resp.status));
+            continue;
+        }
         const auto& body = resp.body;
         // SVG sniff (by extension/content) — vector, so it needs a target size.
         bool is_svg = url.find(u".svg") != std::u16string::npos;
@@ -980,7 +1015,11 @@ void View::load_images(const malibu::html::ParsedDocument&) {
         } else {
             img = malibu::image::decode_image(body.data(), body.size());
         }
-        if (!img.ok) continue;  // (WebP/GIF: a future slice)
+        if (!img.ok) {
+            record_diagnostic(LoadDiagnosticKind::Resource, resolved,
+                              "image format could not be decoded");
+            continue;
+        }
         uint64_t key = (static_cast<uint64_t>(node.index) << 32) | node.generation;
         layout_.set_replaced_intrinsic_size(
             node, static_cast<float>(img.width), static_cast<float>(img.height));
@@ -1045,7 +1084,11 @@ void View::load_images(const malibu::html::ParsedDocument&) {
         int sh = std::clamp(static_cast<int>(std::ceil(intrinsic_h)), 1, 2048);
         std::string svgtext = serialize(node);
         auto img = malibu::image::decode_svg(reinterpret_cast<const uint8_t*>(svgtext.data()), svgtext.size(), sw, sh);
-        if (!img.ok) continue;
+        if (!img.ok) {
+            record_diagnostic(LoadDiagnosticKind::Resource, current_url_,
+                              "inline SVG could not be decoded");
+            continue;
+        }
         uint64_t key = (static_cast<uint64_t>(node.index) << 32) | node.generation;
         layout_.set_replaced_intrinsic_size(node, intrinsic_w, intrinsic_h);
         images_[key] = std::move(img);
@@ -1153,6 +1196,7 @@ std::string View::resolve_url(const std::u16string& ref16) const {
 }
 
 void View::run_scripts(const std::vector<malibu::html::ScriptItem>& items) {
+    const bool trace_scripts = std::getenv("MALIBU_TRACE_SCRIPTS") != nullptr;
     for (size_t index = 0; index < items.size(); ++index) {
         const auto& it = items[index];
         const std::string type = trim_ascii_lower(it.type);
@@ -1188,17 +1232,31 @@ void View::run_scripts(const std::vector<malibu::html::ScriptItem>& items) {
                                   "failed to fetch script");
                 continue;
             }
+            if (is_http_error(resp)) {
+                record_diagnostic(
+                    LoadDiagnosticKind::Resource, url,
+                    "script request returned HTTP " +
+                        std::to_string(resp.status));
+                continue;
+            }
             std::string body(resp.body.begin(), resp.body.end());
+            if (trace_scripts)
+                std::fprintf(stderr, "[script] start %s\n", url.c_str());
             result = engine_.evaluate(body, url);
         } else {
+            if (trace_scripts)
+                std::fprintf(stderr, "[script] start %s\n", url.c_str());
             result = engine_.evaluate(narrow(it.code), url);
         }
+        if (trace_scripts)
+            std::fprintf(stderr, "[script] end %s (%s)\n", url.c_str(),
+                         result.ok ? "ok" : "error");
         if (!result.ok) {
             record_diagnostic(LoadDiagnosticKind::Script, std::move(url),
                               result.error);
         }
     }
-    engine_.run_event_loop();  // settle promises / async / timers queued at load
+    engine_.run_ready_tasks();  // settle microtasks and timers ready during load
 }
 
 void View::record_diagnostic(LoadDiagnosticKind kind, std::string url,
@@ -1250,12 +1308,28 @@ void View::do_load(const std::string& html, const std::string& base_url) {
     // External stylesheets (<link rel=stylesheet>) fetched via the host, then
     // inline <style> blocks — author order so later rules win.
     pending_stylesheets_.clear();
-    if (request_handler_) {
-        for (const std::u16string& href : parsed.external_styles) {
-            network::FetchResponse resp;
-            if (request_handler_(resolve_url(href), resp))
-                pending_stylesheets_.push_back(widen(std::string(resp.body.begin(), resp.body.end())));
+    for (const std::u16string& href : parsed.external_styles) {
+        const std::string url = resolve_url(href);
+        if (!request_handler_) {
+            record_diagnostic(LoadDiagnosticKind::Resource, url,
+                              "no resource loader is installed for stylesheet");
+            continue;
         }
+        network::FetchResponse resp;
+        if (!request_handler_(url, resp)) {
+            record_diagnostic(LoadDiagnosticKind::Resource, url,
+                              "failed to fetch stylesheet");
+            continue;
+        }
+        if (is_http_error(resp)) {
+            record_diagnostic(
+                LoadDiagnosticKind::Resource, url,
+                "stylesheet request returned HTTP " +
+                    std::to_string(resp.status));
+            continue;
+        }
+        pending_stylesheets_.push_back(
+            widen(std::string(resp.body.begin(), resp.body.end())));
     }
     for (auto& s : parsed.stylesheets) pending_stylesheets_.push_back(s);
 
@@ -1265,7 +1339,7 @@ void View::do_load(const std::string& html, const std::string& base_url) {
     run_scripts(parsed.script_items);  // inline + external scripts, in document order
     fire_window_event(u"DOMContentLoaded");
     fire_window_event(u"load");
-    engine_.run_event_loop();       // settle anything queued by load handlers
+    engine_.run_ready_tasks();      // settle anything ready after load handlers
     apply_styles();                 // re-style after script mutations
 }
 
@@ -1388,7 +1462,7 @@ malibu::NodeHandle View::dispatch_mouse(float x, float y, const std::string& typ
         doc_->core(focused_)->focused = true;
     }
     binding_->dispatch_event(hit, widen(type), /*bubbles=*/true, /*cancelable=*/true);
-    engine_.run_event_loop();
+    engine_.run_ready_tasks();
     if ((type == "mouseup" || type == "click") && doc_->core(hit)) doc_->core(hit)->active = false;
     return hit;
 }
@@ -1400,11 +1474,11 @@ void View::dispatch_key(const std::string& key, bool is_text) {
     std::u16string val = tree_->get_attribute(focused_, u"value").value_or(u"");
     if (is_text) val += widen(key);
     else if (key == "Backspace") { if (!val.empty()) val.pop_back(); }
-    else if (key == "Enter") { binding_->dispatch_event(focused_, u"change", true, true); engine_.run_event_loop(); return; }
+    else if (key == "Enter") { binding_->dispatch_event(focused_, u"change", true, true); engine_.run_ready_tasks(); return; }
     else return;
     tree_->set_attribute(focused_, u"value", val);
     binding_->dispatch_event(focused_, u"input", true, true);
-    engine_.run_event_loop();
+    engine_.run_ready_tasks();
 }
 
 float View::page_height(int width) {

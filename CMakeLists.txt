@@ -165,6 +165,7 @@ add_subdirectory(security)
 # Platform backends
 # ---------------------------------------------------------------------------
 add_subdirectory(platform)
+add_subdirectory(host)
 
 # ---------------------------------------------------------------------------
 # Consumer surfaces

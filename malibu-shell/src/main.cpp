@@ -11,9 +11,9 @@
 #include "malibu/text/glyph_drawer.h"
 #include "malibu/render/raster/software_rasterizer.h"
 #include "malibu/image/png.h"
+#include "malibu/host/curl_resource_loader.h"
 
 #include <SDL.h>
-#include <curl/curl.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -58,29 +58,6 @@ std::string narrow(const std::u16string& s) {
         else { r.push_back((char)(0xF0 | (cp >> 18))); r.push_back((char)(0x80 | ((cp >> 12) & 0x3F))); r.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); r.push_back((char)(0x80 | (cp & 0x3F))); }
     }
     return r;
-}
-
-// ---- libcurl fetch (TLS in the host) ----
-size_t write_cb(void* p, size_t s, size_t n, void* u) {
-    auto* v = static_cast<std::vector<uint8_t>*>(u);
-    v->insert(v->end(), (uint8_t*)p, (uint8_t*)p + s * n);
-    return s * n;
-}
-bool fetch(const std::string& url, std::vector<uint8_t>& body) {
-    CURL* c = curl_easy_init();
-    if (!c) return false;
-    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 10L);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(c, CURLOPT_USERAGENT,
-                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Malibu/0.1");
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
-    CURLcode r = curl_easy_perform(c);
-    curl_easy_cleanup(c);
-    return r == CURLE_OK && !body.empty();
 }
 
 // ---- address-bar logic ----
@@ -136,19 +113,37 @@ void fill(Framebuffer& fb, int x0, int y0, int w, int h, Color c) {
 
 int main(int argc, char** argv) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
 
     int win_w = 1280, win_h = 900;
     SDL_Window* win = SDL_CreateWindow("Malibu Browser", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!win) {
+        std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
     SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!ren) {
+        std::fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
     SDL_Texture* tex = nullptr;
 
     malibu::view::View view;
-    view.set_request_handler([](const std::string& url, malibu::network::FetchResponse& out) -> bool {
-        std::vector<uint8_t> b;
-        if (!fetch(url, b)) return false;
-        out.body = std::move(b); out.status = 200; return true;
+    malibu::host::CurlResourceLoader loader;
+    view.set_request_handler([&loader](
+        const std::string& url,
+        malibu::network::FetchResponse& out) -> bool {
+        return loader.fetch(url, out);
+    });
+    view.set_diagnostic_handler([](
+        const malibu::view::LoadDiagnostic& diagnostic) {
+        std::fprintf(stderr, "malibu-browser: %s: %s\n",
+                     diagnostic.url.c_str(), diagnostic.message.c_str());
     });
 
     malibu::text::FontSystem fonts;
@@ -162,9 +157,18 @@ int main(int argc, char** argv) {
     auto content_h = [&]() { return std::max(1, win_h - kChromeH); };
     auto navigate = [&](const std::string& target) {
         status = "loading " + target + " ...";
-        std::vector<uint8_t> page;
-        if (!fetch(target, page)) { status = "failed to load " + target; return; }
-        view.load_html(std::string(page.begin(), page.end()), target);
+        malibu::network::FetchResponse page;
+        if (!loader.fetch(target, page)) {
+            status = "failed: " + loader.last_error();
+            return;
+        }
+        if (page.status >= 400) {
+            status = "HTTP " + std::to_string(page.status) + ": " + target;
+            return;
+        }
+        const std::string base = page.url.empty() ? target : page.url;
+        loader.set_referrer(base);
+        view.load_html(std::string(page.body.begin(), page.body.end()), base);
         url_text = view.current_url();
         scroll_y = 0;
         page_h = view.page_height(win_w);
@@ -180,6 +184,7 @@ int main(int argc, char** argv) {
 
     SDL_StartTextInput();
     bool running = true;
+    uint64_t last_tick = SDL_GetTicks64();
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -254,12 +259,22 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Pump JS timers/promises/rAF; if anything changed layout we re-render.
-        view.run_tasks();
+        // Pump work ready at the real browser clock without draining persistent
+        // intervals forever.
+        uint64_t now_tick = SDL_GetTicks64();
+        view.run_tasks(now_tick - last_tick);
+        last_tick = now_tick;
 
         if (dirty || !tex) {
-            if (!tex)
+            if (!tex) {
                 tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, win_w, win_h);
+                if (!tex) {
+                    std::fprintf(stderr, "SDL_CreateTexture: %s\n",
+                                 SDL_GetError());
+                    running = false;
+                    break;
+                }
+            }
 
             Framebuffer page = view.render(win_w, content_h(), scroll_y);
 
@@ -300,7 +315,6 @@ int main(int argc, char** argv) {
     if (tex) SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
-    curl_global_cleanup();
     SDL_Quit();
     return 0;
 }

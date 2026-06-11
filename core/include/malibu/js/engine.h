@@ -37,6 +37,12 @@ public:
     // Runs the event loop (timers, tasks, rAF) to completion, performing a
     // microtask checkpoint after every task.
     void run_event_loop() { loop_.run_until_idle(); }
+    // Host/browser pump: advance by real elapsed time, then run only work that
+    // is ready now. Persistent intervals remain scheduled for future pumps.
+    void run_ready_tasks(uint64_t elapsed_ms = 0) {
+        loop_.advance_clock(elapsed_ms);
+        loop_.run_ready_tasks();
+    }
 
     void set_console_sink(runtime::ConsoleSink* sink) { interp_.set_console_sink(sink); }
 

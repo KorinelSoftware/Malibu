@@ -51,12 +51,20 @@ struct CompoundSelector {
     std::vector<PseudoClass>    pseudos;
 };
 
+enum class PseudoElement : uint8_t {
+    None,
+    Before,
+    After,
+    Unsupported,
+};
+
 enum class Combinator : uint8_t { Descendant, Child, AdjacentSibling, GeneralSibling };
 
 struct ComplexSelector {
     // steps[0].first (combinator) is unused; steps[i] relates to steps[i-1].
     std::vector<std::pair<Combinator, CompoundSelector>> steps;
     Specificity specificity;
+    PseudoElement pseudo_element = PseudoElement::None;
     bool        valid = false;
 };
 

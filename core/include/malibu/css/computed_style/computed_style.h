@@ -131,6 +131,7 @@ struct ComputedStyle {
     FloatType     float_      = FloatType::None;
     ClearType     clear       = ClearType::None;
     float         border_radius = 0.0f;
+    float         border_radius_percent = 0.0f;
     float         aspect_ratio  = 0.0f;                 // width/height (0 = none) — replaced-element sizing
     std::u16string grid_template_columns;             // e.g. "1fr 2fr" / "repeat(3, 1fr)" / "200px auto"
     float          gap = 0.0f;                          // row/column gap (flex & grid)
@@ -173,6 +174,11 @@ struct ComputedStyle {
     WhiteSpace     white_space = WhiteSpace::Normal;
     TextTransform  text_transform = TextTransform::None;
     VerticalAlign  vertical_align = VerticalAlign::Baseline;
+
+    // Generated content for ::before / ::after. The empty string still creates
+    // a box when content was explicitly specified as "".
+    bool           generates_content = false;
+    std::u16string generated_content;
 
     // CSS custom properties declared on this element (resolved lazily).
     std::unordered_map<std::u16string, std::u16string> custom_props;
