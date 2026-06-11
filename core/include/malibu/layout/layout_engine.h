@@ -42,6 +42,10 @@ public:
     [[nodiscard]] LayoutBox* box_for_node(malibu::NodeHandle h) const;
     [[nodiscard]] LayoutBox* root() const noexcept { return root_; }
 
+    void clear_replaced_intrinsic_sizes() { replaced_intrinsic_sizes_.clear(); }
+    void set_replaced_intrinsic_size(malibu::NodeHandle h, float width,
+                                     float height);
+
     // Topmost element box whose border-box contains the document-space point
     // (x, y). Used for hit-testing mouse input. Null if nothing is hit.
     [[nodiscard]] LayoutBox* hit_test(float x, float y) const;
@@ -78,6 +82,8 @@ private:
 
     std::deque<LayoutBox>                       pool_;
     std::unordered_map<uint64_t, LayoutBox*>    node_to_box_;
+    struct IntrinsicSize { float width = 0, height = 0; };
+    std::unordered_map<uint64_t, IntrinsicSize> replaced_intrinsic_sizes_;
     LayoutBox*                                  root_ = nullptr;
     const TextMeasurer*                         measurer_ = nullptr;
     TextMeasurer                                default_measurer_;

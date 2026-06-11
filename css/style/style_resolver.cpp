@@ -223,6 +223,32 @@ std::optional<Color> parse_color(const std::u16string& in, const Color& current_
     return std::nullopt;
 }
 
+std::optional<Color> parse_svg_paint(const std::u16string& value,
+                                     const Color& current_color,
+                                     bool& uses_current_color) {
+    uses_current_color = false;
+    const std::u16string lowered = lower(trim(value));
+    if (lowered == u"none") return Color{0, 0, 0, 0};
+    if (lowered == u"currentcolor") {
+        uses_current_color = true;
+        return current_color;
+    }
+    if (lowered.rfind(u"url(", 0) == 0) {
+        // Paint servers are not rasterized yet. CSS/SVG permits a fallback
+        // paint after url(...), which still gives deterministic useful output.
+        auto tokens = split_tokens(value);
+        for (auto it = tokens.rbegin(); it != tokens.rend(); ++it) {
+            if (lower(*it) == u"currentcolor") {
+                uses_current_color = true;
+                return current_color;
+            }
+            if (auto color = parse_color(*it, current_color)) return color;
+        }
+        return std::nullopt;
+    }
+    return parse_color(value, current_color);
+}
+
 void parse_box_shorthand(const std::u16string& value, BoxEdge& edge) {
     auto toks = split_tokens(value);
     std::vector<Length> v;
@@ -387,6 +413,11 @@ void apply_property(ComputedStyle& s, const ComputedStyle& parent,
     if (lv == u"inherit") {
         // Copy the parent's value for this property where meaningful.
         if (prop == u"color") s.color = parent.color;
+        else if (prop == u"fill") {
+            s.svg_fill = parent.svg_fill;
+            s.svg_fill_current_color = parent.svg_fill_current_color;
+            s.svg_fill_specified = parent.svg_fill_specified;
+        }
         else if (prop == u"font-size") s.font_size = parent.font_size;
         else if (prop == u"font-family") s.font_family = parent.font_family;
         else if (prop == u"visibility") s.visibility = parent.visibility;
@@ -515,6 +546,14 @@ void apply_property(ComputedStyle& s, const ComputedStyle& parent,
     else if (prop == u"border-left-color") { if (auto c = parse_color(value, s.color)) { s.border_colors[3] = *c; s.border_color = *c; } }
     else if (prop == u"border-color") { if (auto c = parse_color(value, s.color)) { s.border_color = *c; for (auto& bc : s.border_colors) bc = *c; } }
     else if (prop == u"color") { if (auto c = parse_color(value, parent.color)) s.color = *c; }
+    else if (prop == u"fill") {
+        bool current_color = false;
+        if (auto paint = parse_svg_paint(value, s.color, current_color)) {
+            s.svg_fill = *paint;
+            s.svg_fill_current_color = current_color;
+            s.svg_fill_specified = true;
+        }
+    }
     else if (prop == u"box-shadow") parse_box_shadow(value, s);
     else if (prop == u"background-image") { parse_linear_gradient(value, s); }
     else if (prop == u"background-color") { if (auto c = parse_color(value, s.color)) s.background_color = *c; }
@@ -654,6 +693,7 @@ std::u16string user_agent_css() {
         u"select{display:inline-block;border:1px solid #767676;background:#fff;padding:1px 4px;height:22px;color:#000;white-space:nowrap;overflow:hidden;}"
         u"option,optgroup{display:none;}"  // native select shows only the chosen option as a label
         u"button{display:inline-block;border:1px solid #767676;background:#efefef;padding:2px 10px;color:#000;}"
+        u"img,svg,canvas,video{display:inline-block;}"
         u"li{display:list-item;}"
         u"ul,ol,menu{display:block;}"
         u"table{display:table;border-collapse:separate;}"
@@ -699,6 +739,9 @@ ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node, con
     ComputedStyle style = ComputedStyle::initial();
     // Inherit inherited properties + custom properties from the parent.
     style.color = parent.color;
+    style.svg_fill = parent.svg_fill;
+    style.svg_fill_current_color = parent.svg_fill_current_color;
+    style.svg_fill_specified = parent.svg_fill_specified;
     style.font_size = parent.font_size;
     style.font_family = parent.font_family;
     style.font_weight = parent.font_weight;
@@ -713,6 +756,16 @@ ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node, con
 
     // Collect cascade entries that match this node (and whose @media applies).
     std::vector<CascadeEntry> entries;
+    // SVG presentation attributes participate at author origin with zero
+    // specificity, below stylesheet rules and inline style.
+    if (const NodeCore* c = doc.core(node)) {
+        for (const auto& [name, value] : c->attributes) {
+            if (name == u"fill") {
+                apply_property(style, parent, u"fill", value);
+                break;
+            }
+        }
+    }
     for (const MatchableRule& mr : rules_) {
         if (!mr.rule->media.empty() && !media_matches(mr.rule->media, viewport_w_, viewport_h_)) continue;
         if (matches(doc, node, mr.selector)) {
@@ -751,6 +804,7 @@ ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node, con
         std::u16string value = substitute_vars(e.decl->value, style.custom_props);
         apply_property(style, parent, prop, value);
     }
+    if (style.svg_fill_current_color) style.svg_fill = style.color;
 
     // Blockification (CSS Display §2.7): floated / absolutely-positioned elements
     // compute their display as block-level. Without this, an absolutely-positioned

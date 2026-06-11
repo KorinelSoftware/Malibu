@@ -61,6 +61,13 @@ LayoutBox* LayoutEngine::box_for_node(malibu::NodeHandle h) const {
     return it != node_to_box_.end() ? it->second : nullptr;
 }
 
+void LayoutEngine::set_replaced_intrinsic_size(malibu::NodeHandle h,
+                                               float width, float height) {
+    if (width <= 0 || height <= 0) return;
+    replaced_intrinsic_sizes_[key(h)] = {width, height};
+    needs_layout_ = true;
+}
+
 namespace {
 // Deepest element box (has a style) whose border-box contains (x,y). Children
 // are tested last-first so the topmost painted box wins.
@@ -121,10 +128,25 @@ LayoutBox* LayoutEngine::build_box(Document& doc, malibu::NodeHandle node) {
     }
     node_to_box_[key(node)] = box;
 
-    for (malibu::NodeHandle child : c->children) {
-        if (LayoutBox* cb = build_box(doc, child)) {
-            cb->parent = box;
-            box->children.push_back(cb);
+    // Replaced elements contribute one principal box. Their implementation
+    // subtree is painted by the image/canvas/media backend, not laid out as
+    // ordinary HTML descendants.
+    const bool replaced = c->tag_name == u"svg" ||
+                          c->tag_name == u"canvas" ||
+                          c->tag_name == u"img" ||
+                          c->tag_name == u"video";
+    box->is_replaced = replaced;
+    if (auto it = replaced_intrinsic_sizes_.find(key(node));
+        it != replaced_intrinsic_sizes_.end()) {
+        box->intrinsic_width = it->second.width;
+        box->intrinsic_height = it->second.height;
+    }
+    if (!replaced) {
+        for (malibu::NodeHandle child : c->children) {
+            if (LayoutBox* cb = build_box(doc, child)) {
+                cb->parent = box;
+                box->children.push_back(cb);
+            }
         }
     }
 
@@ -159,6 +181,15 @@ void LayoutEngine::resolve_edges(LayoutBox* box, float cb_width) {
 }
 
 namespace {
+float replaced_ratio(const LayoutBox* box) {
+    if (!box) return 0;
+    if (box->style && box->style->aspect_ratio > 0)
+        return box->style->aspect_ratio;
+    if (box->intrinsic_width > 0 && box->intrinsic_height > 0)
+        return box->intrinsic_width / box->intrinsic_height;
+    return 0;
+}
+
 float compute_content_width(LayoutBox* box, float avail, float vw, float vh) {
     const ComputedStyle* s = box->style;
     float h_extra = box->margin[1] + box->margin[3] + box->border[1] + box->border[3] + box->padding[1] + box->padding[3];
@@ -169,13 +200,17 @@ float compute_content_width(LayoutBox* box, float avail, float vw, float vh) {
         w = s->width.resolve(fs, avail, 16.0f, vw, vh);
         if (s->box_sizing == BoxSizing::BorderBox)
             w -= (box->padding[1] + box->padding[3] + box->border[1] + box->border[3]);
+    } else if (box->is_replaced && box->intrinsic_width > 0) {
+        w = box->intrinsic_width;
     } else {
         w = std::max(0.0f, avail - h_extra);
     }
     // Replaced-element sizing: width:auto + explicit height + aspect-ratio → derive width.
-    if (s && s->width.is_auto() && s->aspect_ratio > 0 && !s->height.is_auto() && !s->height.is_percent()) {
+    const float ratio = replaced_ratio(box);
+    if (s && s->width.is_auto() && ratio > 0 &&
+        !s->height.is_auto() && !s->height.is_percent()) {
         float hh = s->height.resolve(fs, 0, 16.0f, vw, vh);
-        w = hh * s->aspect_ratio;
+        w = hh * ratio;
     }
     // max-width / min-width (content-box). max-width can shrink an otherwise-full box.
     if (s && !s->max_width.is_auto()) w = std::min(w, std::max(0.0f, s->max_width.resolve(fs, avail, 16.0f, vw, vh)));
@@ -219,8 +254,12 @@ float compute_height(LayoutBox* box, float content_h, float vw, float vh) {
             if (s->box_sizing == BoxSizing::BorderBox)
                 h -= (box->padding[0] + box->padding[2] + box->border[0] + box->border[2]);
         }
-    } else if (s && s->height.is_auto() && s->aspect_ratio > 0 && box->width > 0) {
-        h = box->width / s->aspect_ratio;   // replaced-element: height from width + aspect-ratio
+    } else if (s && s->height.is_auto() && replaced_ratio(box) > 0 &&
+               box->width > 0) {
+        h = box->width / replaced_ratio(box);
+    } else if (box->is_replaced && box->intrinsic_height > 0 &&
+               (!s || s->height.is_auto())) {
+        h = box->intrinsic_height;
     }
     if (s && !s->max_height.is_auto() && !s->max_height.is_percent()) h = std::min(h, std::max(0.0f, s->max_height.resolve(fs, 0.0f, 16.0f, vw, vh)));
     if (s && !s->min_height.is_auto() && !s->min_height.is_percent()) h = std::max(h, s->min_height.resolve(fs, 0.0f, 16.0f, vw, vh));
@@ -706,6 +745,13 @@ std::pair<float, float> intrinsic_widths(LayoutBox* b, const layout::TextMeasure
     if (s && !s->width.is_auto() && !s->width.is_percent()) {
         float w = s->width.resolve(s->font_size, 0, 16.0f, 0, 0);
         return {w + edges, w + edges};   // explicit width fixes both
+    }
+    if (b->is_replaced) {
+        float w = b->intrinsic_width;
+        const float ratio = replaced_ratio(b);
+        if (s && !s->height.is_auto() && !s->height.is_percent() && ratio > 0)
+            w = s->height.resolve(s->font_size, 0, 16.0f, 0, 0) * ratio;
+        return {w + edges, w + edges};
     }
     float cmin = 0, cmax = 0;
     for (LayoutBox* c : b->children) {

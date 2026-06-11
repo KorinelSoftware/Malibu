@@ -95,6 +95,21 @@ TEST(CSSStyle, InheritanceThroughLevels) {
     EXPECT_FLOAT_EQ(cs->font_size, 20.0f);
 }
 
+TEST(CSSStyle, SvgFillCascadesAndResolvesCurrentColor) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u"body { color: #ff4500; fill: currentColor; }"
+        u"p { fill: url(#gradient) white; }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.div)->svg_fill,
+              (Color{255, 69, 0, 255}));
+    EXPECT_EQ(r.style_for(t.doc, t.p)->svg_fill,
+              (Color{255, 255, 255, 255}));
+}
+
 TEST(CSSStyle, VarResolvesFromNearestAncestor) {
     Tree t;
     CSSParser parser;

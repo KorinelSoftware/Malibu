@@ -9,6 +9,7 @@
 
 using malibu::view::View;
 using malibu::view::SandboxNoNavigation;
+using malibu::view::LoadDiagnosticKind;
 
 TEST(View, LoadHtmlAndRenderRealPage) {
     View v;
@@ -131,4 +132,54 @@ TEST(View, AsyncScriptSettlesViaEventLoop) {
         "https://example.com/");
     // run_scripts already pumped the event loop at load.
     EXPECT_EQ(v.eval_js("globalThis.done"), "42");
+}
+
+TEST(View, DataScriptsAreNotEvaluatedAsJavaScript) {
+    View v;
+    v.load_html(
+        "<body><script type='application/ld+json'>{\"name\":\"Malibu\"}</script>"
+        "<script>globalThis.afterData = 7;</script></body>",
+        "https://example.com/");
+    EXPECT_TRUE(v.diagnostics().empty());
+    EXPECT_EQ(v.eval_js("globalThis.afterData"), "7");
+}
+
+TEST(View, ReportsScriptErrorsAndContinuesLoading) {
+    View v;
+    v.load_html(
+        "<body><script>let = ;</script>"
+        "<script>globalThis.afterError = 9;</script></body>",
+        "https://example.com/page");
+    ASSERT_EQ(v.diagnostics().size(), 1u);
+    EXPECT_EQ(v.diagnostics()[0].kind, LoadDiagnosticKind::Script);
+    EXPECT_EQ(v.diagnostics()[0].url,
+              "https://example.com/page#inline-script-1");
+    EXPECT_FALSE(v.diagnostics()[0].message.empty());
+    EXPECT_EQ(v.eval_js("globalThis.afterError"), "9");
+}
+
+TEST(View, ReportsExternalScriptFetchFailures) {
+    View v;
+    v.set_request_handler(
+        [](const std::string&, malibu::network::FetchResponse&) {
+            return false;
+        });
+    v.load_html("<body><script src='missing.js'></script></body>",
+                "https://example.com/path/page");
+    ASSERT_EQ(v.diagnostics().size(), 1u);
+    EXPECT_EQ(v.diagnostics()[0].kind, LoadDiagnosticKind::Resource);
+    EXPECT_EQ(v.diagnostics()[0].url,
+              "https://example.com/path/missing.js");
+}
+
+TEST(View, ReportsUnsupportedModuleScriptsWithoutRunningThemAsClassic) {
+    View v;
+    v.load_html(
+        "<body><script type='module'>globalThis.moduleRan = true;</script>"
+        "<script nomodule>globalThis.fallbackRan = true;</script></body>",
+        "https://example.com/");
+    ASSERT_EQ(v.diagnostics().size(), 1u);
+    EXPECT_EQ(v.diagnostics()[0].kind, LoadDiagnosticKind::Unsupported);
+    EXPECT_EQ(v.eval_js("typeof globalThis.moduleRan"), "\"undefined\"");
+    EXPECT_EQ(v.eval_js("globalThis.fallbackRan"), "true");
 }

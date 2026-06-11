@@ -56,6 +56,24 @@ TEST(HTMLParser, CapturesScriptsAndStyles) {
     EXPECT_EQ(parsed.scripts[0], std::u16string(u"var x = 1 < 2;"));  // '<' not treated as a tag
 }
 
+TEST(HTMLParser, PreservesScriptLoadingAttributes) {
+    Document doc; DOMTree tree(doc);
+    HTMLParser p;
+    auto parsed = p.parse(
+        u"<script src='app.js' type='module' async defer nomodule></script>"
+        u"<script type='application/ld+json'>{\"name\":\"Malibu\"}</script>",
+        tree);
+    ASSERT_EQ(parsed.script_items.size(), 2u);
+    EXPECT_TRUE(parsed.script_items[0].external);
+    EXPECT_TRUE(parsed.script_items[0].async);
+    EXPECT_TRUE(parsed.script_items[0].defer);
+    EXPECT_TRUE(parsed.script_items[0].no_module);
+    EXPECT_EQ(parsed.script_items[0].src, u"app.js");
+    EXPECT_EQ(parsed.script_items[0].type, u"module");
+    EXPECT_FALSE(parsed.script_items[1].external);
+    EXPECT_EQ(parsed.script_items[1].type, u"application/ld+json");
+}
+
 TEST(HTMLParser, Entities) {
     Document doc; DOMTree tree(doc);
     HTMLParser p;

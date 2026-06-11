@@ -40,6 +40,18 @@ enum SandboxFlags : uint32_t {
     SandboxNoNavigation  = 1u << 2,
 };
 
+enum class LoadDiagnosticKind : uint8_t {
+    Resource,
+    Script,
+    Unsupported,
+};
+
+struct LoadDiagnostic {
+    LoadDiagnosticKind kind = LoadDiagnosticKind::Resource;
+    std::string url;
+    std::string message;
+};
+
 class View {
 public:
     View();
@@ -99,6 +111,17 @@ public:
     using RequestHandler = std::function<bool(const std::string& url, network::FetchResponse& out)>;
     void set_request_handler(RequestHandler handler) { request_handler_ = std::move(handler); }
 
+    // Diagnostics are reset for every document load. Browsers continue loading
+    // after most script/resource failures, so embedders need a separate channel
+    // instead of relying on load_html() returning false.
+    using DiagnosticHandler = std::function<void(const LoadDiagnostic&)>;
+    void set_diagnostic_handler(DiagnosticHandler handler) {
+        diagnostic_handler_ = std::move(handler);
+    }
+    [[nodiscard]] const std::vector<LoadDiagnostic>& diagnostics() const noexcept {
+        return diagnostics_;
+    }
+
     // ---- WebSocket transport (host-driven; the engine has no TLS of its own) ----
     // When page JS does `new WebSocket(url)`, the view assigns an id and calls
     // this handler so the host can open the real connection. The host then drives
@@ -131,6 +154,8 @@ private:
     void reset_document();
     void apply_styles();
     void run_scripts(const std::vector<malibu::html::ScriptItem>& items);
+    void record_diagnostic(LoadDiagnosticKind kind, std::string url,
+                           std::string message);
     // Resolves a possibly-relative script/resource URL against the current page.
     std::string resolve_url(const std::u16string& ref) const;
     // Dispatches a window-level event (e.g. DOMContentLoaded / load) to listeners
@@ -197,6 +222,8 @@ private:
 
     std::function<void(const std::string&)> message_handler_;
     RequestHandler                          request_handler_;
+    DiagnosticHandler                       diagnostic_handler_;
+    std::vector<LoadDiagnostic>              diagnostics_;
     SocketHandler                           socket_handler_;
     // Live WebSocket JS objects keyed by id (host-rooted while connected).
     std::vector<std::pair<int, js::runtime::Value>> sockets_;

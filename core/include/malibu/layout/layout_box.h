@@ -37,6 +37,12 @@ struct LayoutBox {
     float x = 0, y = 0;
     float width = 0, height = 0;
 
+    // Natural dimensions supplied by a replaced-element backend. These are
+    // layout inputs, not synthesized CSS declarations.
+    bool  is_replaced = false;
+    float intrinsic_width = 0;
+    float intrinsic_height = 0;
+
     // Resolved box-model edges (px): order top, right, bottom, left.
     float margin[4]  = {0, 0, 0, 0};
     float padding[4] = {0, 0, 0, 0};

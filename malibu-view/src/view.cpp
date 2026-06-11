@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -56,6 +57,52 @@ std::u16string widen(const std::string& s) {
     }
     return out;
 }
+
+std::string trim_ascii_lower(std::u16string_view value) {
+    size_t first = 0;
+    while (first < value.size() && std::isspace(
+               static_cast<unsigned char>(value[first] & 0xFF))) {
+        ++first;
+    }
+    size_t last = value.size();
+    while (last > first && std::isspace(
+               static_cast<unsigned char>(value[last - 1] & 0xFF))) {
+        --last;
+    }
+    std::string out;
+    out.reserve(last - first);
+    for (size_t i = first; i < last; ++i) {
+        char c = static_cast<char>(value[i] & 0xFF);
+        out.push_back(static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+bool is_classic_script_type(const std::string& type) {
+    if (type.empty()) return true;
+    static constexpr const char* kJavaScriptTypes[] = {
+        "application/ecmascript",
+        "application/javascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/javascript",
+        "text/javascript1.0",
+        "text/javascript1.1",
+        "text/javascript1.2",
+        "text/javascript1.3",
+        "text/javascript1.4",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+    };
+    return std::any_of(std::begin(kJavaScriptTypes),
+                       std::end(kJavaScriptTypes),
+                       [&](const char* candidate) { return type == candidate; });
+}
 }  // namespace
 
 View::View() {
@@ -89,6 +136,7 @@ void View::reset_document() {
         x = b->x; y = b->y; w = b->width; h = b->height; return true;
     });
     canvases_.clear();
+    layout_.clear_replaced_intrinsic_sizes();
     install_view_globals();
 }
 
@@ -884,7 +932,7 @@ void View::composite_canvases(render::Framebuffer& fb, float scroll_y) {
 
 void View::load_images(const malibu::html::ParsedDocument&) {
     images_.clear();
-    if (!request_handler_) return;
+    layout_.clear_replaced_intrinsic_sizes();
     std::vector<malibu::NodeHandle> imgs;
     tree_->query_selector_all(doc_->root(), u"img", imgs);
     // Picks the best URL from an <img>: real src, else the last (largest) srcset
@@ -909,6 +957,7 @@ void View::load_images(const malibu::html::ParsedDocument&) {
         return src;
     };
     for (malibu::NodeHandle node : imgs) {
+        if (!request_handler_) continue;
         std::u16string url = pick_url(node);
         if (url.empty() || url.rfind(u"data:", 0) == 0) continue;
         network::FetchResponse resp;
@@ -933,47 +982,8 @@ void View::load_images(const malibu::html::ParsedDocument&) {
         }
         if (!img.ok) continue;  // (WebP/GIF: a future slice)
         uint64_t key = (static_cast<uint64_t>(node.index) << 32) | node.generation;
-        // Replaced-element sizing: set the intrinsic aspect-ratio + only the
-        // dimension(s) given (attrs or, as a default, the intrinsic width). The
-        // layout derives the other side from the aspect-ratio, and author CSS
-        // (max-width:100%, width:…, height:auto) overrides — so images keep their
-        // proportions instead of stretching.
-        std::string author;
-        if (auto s = tree_->get_attribute(node, u"style")) author = narrow(*s);
-        // Does author CSS already set the `width`/`height` property (not min-/max-)?
-        // If so we must NOT append an intrinsic default that would override it
-        // (later declaration wins in one inline style string).
-        // True iff author CSS sets `prop` to an explicit (non-auto) value. `auto`
-        // doesn't count — e.g. the responsive `max-width:100%;height:auto` pattern
-        // must still get an intrinsic width default.
-        auto has_dim = [&](const char* prop) {
-            std::string low; low.reserve(author.size());
-            for (char c : author) low += (c >= 'A' && c <= 'Z') ? char(c + 32) : c;
-            std::string p = prop; size_t pos = 0;
-            while ((pos = low.find(p, pos)) != std::string::npos) {
-                bool before = (pos == 0) || low[pos-1] == ';' || low[pos-1] == ' ';
-                size_t a = pos + p.size(); while (a < low.size() && low[a] == ' ') ++a;
-                if (before && a < low.size() && low[a] == ':') {
-                    size_t v = a + 1; while (v < low.size() && low[v] == ' ') ++v;
-                    if (low.compare(v, 4, "auto") != 0) return true;  // explicit size
-                }
-                pos += p.size();
-            }
-            return false;
-        };
-        bool css_w = has_dim("width"), css_h = has_dim("height");
-        std::string style = author.empty() ? "" : author + ";";
-        style += "display:inline-block;aspect-ratio:" + std::to_string(img.width) + "/" + std::to_string(std::max(1, img.height)) + ";";
-        if (!css_w && !css_h) {
-            if (wattr > 0 && hattr > 0)  style += "width:" + std::to_string(wattr) + "px;height:" + std::to_string(hattr) + "px";
-            else if (wattr > 0)          style += "width:" + std::to_string(wattr) + "px";
-            else if (hattr > 0)          style += "height:" + std::to_string(hattr) + "px";
-            else                         style += "width:" + std::to_string(img.width) + "px";
-        } else {  // author set one dim via CSS; supply the other from an attr if given
-            if (wattr > 0 && !css_w) style += "width:" + std::to_string(wattr) + "px";
-            if (hattr > 0 && !css_h) style += "height:" + std::to_string(hattr) + "px";
-        }
-        tree_->set_attribute(node, u"style", widen(style));
+        layout_.set_replaced_intrinsic_size(
+            node, static_cast<float>(img.width), static_cast<float>(img.height));
         images_[key] = std::move(img);
     }
 
@@ -986,24 +996,58 @@ void View::load_images(const malibu::html::ParsedDocument&) {
         if (c->node_type == malibu::dom::kTextNode) return narrow(c->text_content);
         if (c->node_type != malibu::dom::kElementNode) return "";
         std::string o = "<" + narrow(c->tag_name);
-        for (auto& [k, v] : c->attributes) o += " " + narrow(k) + "=\"" + narrow(v) + "\"";
+        std::string inline_style;
+        for (auto& [k, v] : c->attributes) {
+            if (k == u"style") inline_style = narrow(v);
+            else o += " " + narrow(k) + "=\"" + narrow(v) + "\"";
+        }
+        if (c->computed_style && c->computed_style->svg_fill_specified) {
+            const auto fill = c->computed_style->svg_fill;
+            if (!inline_style.empty() && inline_style.back() != ';')
+                inline_style.push_back(';');
+            inline_style += "fill:rgba(" + std::to_string(fill.r) + "," +
+                            std::to_string(fill.g) + "," +
+                            std::to_string(fill.b) + "," +
+                            std::to_string(fill.a / 255.0f) + ")";
+        }
+        if (!inline_style.empty()) o += " style=\"" + inline_style + "\"";
         o += ">";
         for (auto ch : c->children) o += serialize(ch);
         return o + "</" + narrow(c->tag_name) + ">";
     };
     for (malibu::NodeHandle node : svgs) {
-        int sw = 0, sh = 0;
-        if (auto a = tree_->get_attribute(node, u"width")) sw = std::atoi(narrow(*a).c_str());
-        if (auto a = tree_->get_attribute(node, u"height")) sh = std::atoi(narrow(*a).c_str());
-        if (sw <= 0) sw = sh > 0 ? sh : 24;
-        if (sh <= 0) sh = sw > 0 ? sw : 24;
+        float intrinsic_w = 0, intrinsic_h = 0, ratio = 0;
+        if (auto a = tree_->get_attribute(node, u"width"))
+            intrinsic_w = std::strtof(narrow(*a).c_str(), nullptr);
+        if (auto a = tree_->get_attribute(node, u"height"))
+            intrinsic_h = std::strtof(narrow(*a).c_str(), nullptr);
+        auto view_box = tree_->get_attribute(node, u"viewbox");
+        if (view_box) {
+            std::istringstream values(narrow(*view_box));
+            float x = 0, y = 0, width = 0, height = 0;
+            if (values >> x >> y >> width >> height && width > 0 && height > 0)
+                ratio = width / height;
+        }
+        if (ratio <= 0 && intrinsic_w > 0 && intrinsic_h > 0)
+            ratio = intrinsic_w / intrinsic_h;
+        if (intrinsic_w <= 0 && intrinsic_h > 0 && ratio > 0)
+            intrinsic_w = intrinsic_h * ratio;
+        if (intrinsic_h <= 0 && intrinsic_w > 0 && ratio > 0)
+            intrinsic_h = intrinsic_w / ratio;
+        if (intrinsic_w <= 0 && intrinsic_h <= 0) {
+            intrinsic_w = ratio > 0 ? 150.0f * ratio : 300.0f;
+            intrinsic_h = 150.0f;
+        } else {
+            if (intrinsic_w <= 0) intrinsic_w = 300.0f;
+            if (intrinsic_h <= 0) intrinsic_h = 150.0f;
+        }
+        int sw = std::clamp(static_cast<int>(std::ceil(intrinsic_w)), 1, 2048);
+        int sh = std::clamp(static_cast<int>(std::ceil(intrinsic_h)), 1, 2048);
         std::string svgtext = serialize(node);
         auto img = malibu::image::decode_svg(reinterpret_cast<const uint8_t*>(svgtext.data()), svgtext.size(), sw, sh);
         if (!img.ok) continue;
         uint64_t key = (static_cast<uint64_t>(node.index) << 32) | node.generation;
-        std::string style = "display:inline-block;width:" + std::to_string(sw) + "px;height:" + std::to_string(sh) + "px";
-        if (auto s = tree_->get_attribute(node, u"style")) style = narrow(*s) + ";" + style;
-        tree_->set_attribute(node, u"style", widen(style));
+        layout_.set_replaced_intrinsic_size(node, intrinsic_w, intrinsic_h);
         images_[key] = std::move(img);
     }
 
@@ -1109,19 +1153,63 @@ std::string View::resolve_url(const std::u16string& ref16) const {
 }
 
 void View::run_scripts(const std::vector<malibu::html::ScriptItem>& items) {
-    for (const auto& it : items) {
+    for (size_t index = 0; index < items.size(); ++index) {
+        const auto& it = items[index];
+        const std::string type = trim_ascii_lower(it.type);
+        if (type == "module") {
+            record_diagnostic(
+                LoadDiagnosticKind::Unsupported,
+                it.external ? resolve_url(it.src) : current_url_,
+                "module scripts are not implemented");
+            continue;
+        }
+        if (!is_classic_script_type(type)) {
+            continue;  // JSON, import maps and other data blocks are not JS.
+        }
+
+        std::string url = current_url_ + "#inline-script-" +
+                          std::to_string(index + 1);
+        js::Engine::EvalResult result;
         if (it.external) {
-            if (!request_handler_) continue;  // no transport wired: skip external script
-            std::string url = resolve_url(it.src);
+            url = resolve_url(it.src);
+            if (it.src.empty()) {
+                record_diagnostic(LoadDiagnosticKind::Resource, url,
+                                  "script has an empty src attribute");
+                continue;
+            }
+            if (!request_handler_) {
+                record_diagnostic(LoadDiagnosticKind::Resource, url,
+                                  "no resource loader is installed");
+                continue;
+            }
             network::FetchResponse resp;
-            if (!request_handler_(url, resp)) continue;  // 404 / unresolved
+            if (!request_handler_(url, resp)) {
+                record_diagnostic(LoadDiagnosticKind::Resource, url,
+                                  "failed to fetch script");
+                continue;
+            }
             std::string body(resp.body.begin(), resp.body.end());
-            engine_.evaluate(body, url);
+            result = engine_.evaluate(body, url);
         } else {
-            engine_.evaluate(narrow(it.code), current_url_);
+            result = engine_.evaluate(narrow(it.code), url);
+        }
+        if (!result.ok) {
+            record_diagnostic(LoadDiagnosticKind::Script, std::move(url),
+                              result.error);
         }
     }
     engine_.run_event_loop();  // settle promises / async / timers queued at load
+}
+
+void View::record_diagnostic(LoadDiagnosticKind kind, std::string url,
+                             std::string message) {
+    constexpr size_t kMaxMessageLength = 4096;
+    if (message.size() > kMaxMessageLength) {
+        message.resize(kMaxMessageLength);
+        message += "...";
+    }
+    diagnostics_.push_back({kind, std::move(url), std::move(message)});
+    if (diagnostic_handler_) diagnostic_handler_(diagnostics_.back());
 }
 
 void View::fire_window_event(const std::u16string& type) {
@@ -1149,6 +1237,7 @@ void View::fire_window_event(const std::u16string& type) {
 
 void View::do_load(const std::string& html, const std::string& base_url) {
     layout_dirty_ = true;  // a fresh document always needs styling + layout
+    diagnostics_.clear();
     // Set the URL/origin BEFORE reset_document so install_view_globals builds
     // `location` from the page being loaded (not the previous one).
     current_url_ = base_url;
@@ -1170,8 +1259,9 @@ void View::do_load(const std::string& html, const std::string& base_url) {
     }
     for (auto& s : parsed.stylesheets) pending_stylesheets_.push_back(s);
 
-    load_images(parsed);            // fetch + decode <img> (sizes boxes for layout)
-    apply_styles();                 // initial cascade
+    apply_styles();                 // cascade is needed to rasterize inline SVG
+    load_images(parsed);            // decode replaced elements + intrinsic sizes
+    apply_styles();                 // form-control defaults currently mutate style attrs
     run_scripts(parsed.script_items);  // inline + external scripts, in document order
     fire_window_event(u"DOMContentLoaded");
     fire_window_event(u"load");

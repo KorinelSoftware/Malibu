@@ -137,6 +137,9 @@ struct ComputedStyle {
 
     // Visual
     Color          color            = {0, 0, 0, 255};
+    Color          svg_fill         = {0, 0, 0, 255};
+    bool           svg_fill_current_color = false;
+    bool           svg_fill_specified = false;
     Color          background_color  = {0, 0, 0, 0};
     Color          border_color      = {0, 0, 0, 255};
     Color          border_colors[4]  = {{0,0,0,255},{0,0,0,255},{0,0,0,255},{0,0,0,255}};  // per side T,R,B,L

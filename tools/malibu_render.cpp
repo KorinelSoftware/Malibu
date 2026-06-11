@@ -54,6 +54,15 @@ int main(int argc, char** argv) {
     bool is_url = input.rfind("http://", 0) == 0 || input.rfind("https://", 0) == 0;
 
     malibu::view::View view;
+    view.set_diagnostic_handler([](const malibu::view::LoadDiagnostic& diagnostic) {
+        const char* kind = "resource";
+        if (diagnostic.kind == malibu::view::LoadDiagnosticKind::Script)
+            kind = "script";
+        else if (diagnostic.kind == malibu::view::LoadDiagnosticKind::Unsupported)
+            kind = "unsupported";
+        std::fprintf(stderr, "malibu_render: %s: %s: %s\n", kind,
+                     diagnostic.url.c_str(), diagnostic.message.c_str());
+    });
 
     if (is_url) {
         // Host fetches the page + every subresource the engine asks for.

@@ -65,11 +65,16 @@ Col parse_color(std::string v) {
 
 // Extract attribute `name` from a tag's attribute span. Returns "" if absent.
 std::string attr(const std::string& tag, const std::string& name) {
+    // SVG embedded in text/html goes through HTML attribute-name
+    // normalization in Malibu's DOM. Match names ASCII-case-insensitively so
+    // camel-cased SVG attributes such as viewBox survive serialization.
+    const std::string folded_tag = lower(tag);
+    const std::string folded_name = lower(name);
     size_t p = 0;
-    while ((p = tag.find(name, p)) != std::string::npos) {
+    while ((p = folded_tag.find(folded_name, p)) != std::string::npos) {
         // must be a whole attribute name (preceded by space, followed by = or space)
         bool lhs_ok = p == 0 || tag[p-1] == ' ' || tag[p-1] == '\t' || tag[p-1] == '\n' || tag[p-1] == '<';
-        size_t after = p + name.size();
+        size_t after = p + folded_name.size();
         size_t q = after; while (q < tag.size() && (tag[q]==' '||tag[q]=='\t'||tag[q]=='\n')) ++q;
         if (lhs_ok && q < tag.size() && tag[q] == '=') {
             q++; while (q < tag.size() && (tag[q]==' '||tag[q]=='"'||tag[q]=='\'')) ++q;

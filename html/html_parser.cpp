@@ -219,10 +219,28 @@ private:
                 tree_.append_child(el, tn);
             }
             if (name == u"script") {
-                std::u16string src;
-                for (auto& [k, v] : attrs) if (k == u"src") src = v;
-                if (!src.empty()) result_.script_items.push_back(ScriptItem{true, {}, src});
-                else { result_.scripts.push_back(content); result_.script_items.push_back(ScriptItem{false, content, {}}); }
+                ScriptItem item;
+                for (auto& [k, v] : attrs) {
+                    if (k == u"src") {
+                        item.external = true;
+                        item.src = v;
+                    } else if (k == u"type") {
+                        item.type = v;
+                    } else if (k == u"async") {
+                        item.async = true;
+                    } else if (k == u"defer") {
+                        item.defer = true;
+                    } else if (k == u"nomodule") {
+                        item.no_module = true;
+                    }
+                }
+                if (item.external) {
+                    result_.script_items.push_back(std::move(item));
+                } else {
+                    item.code = content;
+                    result_.scripts.push_back(content);
+                    result_.script_items.push_back(std::move(item));
+                }
             } else if (name == u"style") {
                 result_.stylesheets.push_back(content);
             }

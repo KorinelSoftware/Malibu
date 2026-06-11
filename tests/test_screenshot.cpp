@@ -58,3 +58,44 @@ TEST(Screenshot, RendersTextPage) {
     EXPECT_GT(dark, 20);
     std::remove(path.c_str());
 }
+
+TEST(Screenshot, InlineSvgRetainsHtmlNormalizedViewBox) {
+    View view;
+    ASSERT_TRUE(view.load_html(
+        "<style>"
+        "body{margin:0}"
+        "svg{display:block;width:128px;height:128px}"
+        "</style>"
+        "<svg viewBox='0 0 216 216'>"
+        "<path fill='#d93900' "
+        "d='M108 0 C48 0 0 48 0 108 C0 168 48 216 108 216 "
+        "C168 216 216 168 216 108 C216 48 168 0 108 0 Z'/>"
+        "</svg>",
+        "https://example.com/"));
+
+    auto fb = view.render(160, 160);
+    int orange_pixels = 0;
+    for (int y = 0; y < fb.height; ++y) {
+        for (int x = 0; x < fb.width; ++x) {
+            const auto pixel = fb.at(x, y);
+            if (pixel.r > 150 && pixel.g < 100 && pixel.b < 80)
+                ++orange_pixels;
+        }
+    }
+    EXPECT_GT(orange_pixels, 4000);
+}
+
+TEST(Screenshot, SvgDecoderAcceptsLowercaseViewboxFromHtmlDom) {
+    const std::string svg =
+        "<svg viewbox='0 0 216 216'>"
+        "<circle fill='#d93900' cx='108' cy='108' r='100'></circle>"
+        "</svg>";
+    auto image = malibu::image::decode_svg(
+        reinterpret_cast<const uint8_t*>(svg.data()), svg.size(), 64, 64);
+    ASSERT_TRUE(image.ok);
+    int opaque_pixels = 0;
+    for (size_t i = 3; i < image.rgba.size(); i += 4) {
+        if (image.rgba[i] != 0) ++opaque_pixels;
+    }
+    EXPECT_GT(opaque_pixels, 2000);
+}

@@ -14,11 +14,16 @@
 
 namespace malibu::html {
 
-// A <script> in document order: either inline source or an external `src` URL.
+// A <script> in document order. Attribute metadata is preserved so the loader
+// can distinguish executable scripts from data blocks and schedule them.
 struct ScriptItem {
     bool          external = false;
+    bool          async = false;
+    bool          defer = false;
+    bool          no_module = false;
     std::u16string code;   // inline source (when !external)
     std::u16string src;    // URL (when external)
+    std::u16string type;   // normalized by the loader (the parser preserves text)
 };
 
 struct ParsedDocument {
