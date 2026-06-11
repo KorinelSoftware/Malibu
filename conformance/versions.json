@@ -1,0 +1,16 @@
+{
+  "wpt": {
+    "repository": "https://github.com/web-platform-tests/wpt.git",
+    "commit": "4b974d31f13ba837778c2109d0c1e972eb9657f5"
+  },
+  "test262": {
+    "repository": "https://github.com/tc39/test262.git",
+    "commit": "05bb032907160d66c212589d345fa0e335e2738c"
+  },
+  "chrome_for_testing": {
+    "channel": "Stable",
+    "version": "149.0.7827.55",
+    "revision": "1625079",
+    "linux64_url": "https://storage.googleapis.com/chrome-for-testing-public/149.0.7827.55/linux64/chrome-linux64.zip"
+  }
+}
