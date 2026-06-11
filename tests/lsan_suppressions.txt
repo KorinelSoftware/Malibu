@@ -1,0 +1,12 @@
+# LeakSanitizer suppressions for third-party leaks outside Malibu's control.
+# fontconfig loads a process-global default configuration (parsed via expat)
+# that it intentionally retains for the process lifetime; LSan reports it as a
+# leak. These suppress only frames inside those libraries, so leaks in Malibu's
+# own code are still caught.
+leak:libfontconfig
+leak:libexpat
+leak:FcConfig
+leak:FcInit
+leak:FcDefaultSubstitute
+leak:FcFontMatch
+leak:XML_Parse

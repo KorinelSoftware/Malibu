@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { margin: 0; background-color: #f4f6fb; font-family: sans-serif; color: #1a1a2e; }
+  .header { background-color: #4361ee; color: #ffffff; padding: 24px; }
+  .header h1 { font-size: 34px; }
+  .header p { font-size: 16px; color: #d7e3ff; }
+  .container { padding: 24px; }
+  .row { display: flex; justify-content: space-between; }
+  .card { background-color: #ffffff; border: 2px solid #4361ee; width: 200px; height: 120px; padding: 16px; }
+  .card h2 { font-size: 20px; color: #3a0ca3; }
+  .card p { font-size: 14px; color: #555555; }
+  .accent { background-color: #f72585; color: #ffffff; padding: 12px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>Malibu Engine</h1>
+    <p>A web engine rendered without Chromium</p>
+  </div>
+  <div class="container">
+    <div class="row">
+      <div class="card"><h2>HTML</h2><p>Parsed into a live DOM tree.</p></div>
+      <div class="card"><h2>CSS</h2><p>Cascade, inheritance and flexbox.</p></div>
+      <div class="card"><h2>Text</h2><p>Shaped with HarfBuzz and FreeType.</p></div>
+    </div>
+    <div class="accent">JavaScript runs through the WebCall ABI.</div>
+  </div>
+  <script>
+    var note = document.createElement('p');
+    note.textContent = 'This paragraph was added by JavaScript.';
+    document.querySelector('.container').appendChild(note);
+  </script>
+</body>
+</html>

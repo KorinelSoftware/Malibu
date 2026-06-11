@@ -1,0 +1,13 @@
+/build/
+/.cache/
+/.conformance/
+/.secrets/
+
+*.log
+*.profraw
+*.profdata
+core.*
+
+.env
+.env.*
+!.env.example

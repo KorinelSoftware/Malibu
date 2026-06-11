@@ -1,0 +1,9 @@
+#pragma once
+// GENERATED FILE — do not edit. Source: core/capability_manifest/capability_manifest.json
+// Embeds the capability manifest JSON as a compile-time resource (Task 4).
+
+namespace malibu::capability_manifest {
+
+inline constexpr const char* kEmbeddedManifestJson = R"MALIBU_MANIFEST(@MALIBU_MANIFEST_JSON@)MALIBU_MANIFEST";
+
+} // namespace malibu::capability_manifest
