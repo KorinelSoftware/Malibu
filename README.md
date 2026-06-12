@@ -1,4 +1,4 @@
-![Malibu Banner](assets/malibu-banner.png)
+![Malibu Banner](tools/malibu-banner.png)
 
 # Malibu
 
