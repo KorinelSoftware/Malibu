@@ -1,67 +1,90 @@
+![Malibu Banner](assets/malibu-banner.png)
+
 # Malibu
 
-A modern, high-performance web engine built with C++20, targeting full modern page compatibility.
+A modern web engine built from scratch in C++20.
+
+Malibu is an experimental browser engine focused on performance, simplicity, and architectural innovation. Unlike traditional browser architectures, Malibu treats the web platform as a structured operating environment where JavaScript, the DOM, rendering, networking, and platform APIs are integrated through a unified architecture.
 
 ## Features
 
-- **JavaScript Engine** — Custom JS engine with bytecode compiler, interpreter, JIT-ready IR, typed arrays, and DOM bindings
-- **CSS Engine** — Full CSS parser, style resolver, computed style system
-- **HTML/DOM** — HTML parser, DOM tree construction, event handling
-- **Layout & Render** — Layout engine, display list, Vulkan/OpenGL rendering pipeline
-- **Image Decoding** — JPEG, PNG, GIF support
-- **WebAssembly** — WASM runtime integration
-- **Storage** — Cookie store, Web Storage API
-- **Networking** — HTTP client with cURL backend, WebCall ABI
-- **Security** — Permissions, sandboxing policies
-- **Canvas 2D / WebGL** — GPU-accelerated graphics
-- **Text & Fonts** — Text shaping, font loading
-- **Platform** — Linux, Windows, macOS, Android, iOS support
-- **Integrations** — malibu-shell (standalone), malibu-view (embedding), malibu-browser, malibu-electron, malibu-cef, malibu-app-runtime
+- Modern HTML, CSS and JavaScript support
+- Custom JavaScript engine (MalibuJS)
+- Unified Object Graph (UOG)
+- WebCall ABI architecture
+- Software and GPU rendering backends
+- Canvas2D support
+- WebGL support
+- WebAssembly support
+- Embedded view API (MalibuView)
+- Cross-platform design
+
+## Architecture
+
+Malibu is built around several core technologies:
+
+### MalibuJS
+A custom JavaScript engine featuring:
+
+- Register-based virtual machine
+- NaN-boxed values
+- Generational garbage collection
+- Test262 compatibility
+
+### Unified Object Graph (UOG)
+
+Instead of maintaining separate JavaScript and DOM heaps, Malibu uses a unified memory model where web objects coexist within the same graph.
+
+Benefits:
+
+- No wrapper synchronization
+- Faster object access
+- Reduced memory overhead
+- Simpler garbage collection
+
+### WebCall ABI
+
+Web APIs are exposed through a lightweight ABI layer similar to operating system syscalls.
+
+This provides:
+
+- Lower API overhead
+- Clear browser-engine boundaries
+- Better optimization opportunities
+- Simplified embedding
+
+## Current Status
+
+Malibu is under active development.
+
+Implemented:
+
+- HTML parser
+- DOM tree
+- CSS parser
+- Style system
+- Layout engine
+- Flexbox
+- Tables
+- Canvas2D
+- WebGL
+- WebAssembly runtime
+- JavaScript engine
+- Embedded browser view
+
+In Progress:
+
+- SVG rendering
+- Advanced CSS support
+- Additional Web APIs
+- GPU acceleration improvements
+- Web platform compatibility
 
 ## Building
 
 ```bash
+git clone https://github.com/korinel/malibu.git
+cd malibu
+
 cmake -B build -G Ninja
 cmake --build build
-```
-
-### Dependencies
-
-- C++20 compiler (Clang 16+ or GCC 13+)
-- CMake 3.25+
-- Vulkan SDK (optional, for GPU rendering)
-- cURL (for HTTP networking)
-- simdjson (vendored or system)
-- googletest (vendored automatically)
-
-## Project Structure
-
-- `core/` — Engine-agnostic data structures, utilities, and interfaces
-- `js/` — JavaScript engine (parser, compiler, runtime, heap)
-- `css/` — CSS parser, style resolution
-- `html/` — HTML parser, DOM
-- `render/` — Display list, GPU rendering
-- `layout/` — Box tree, layout engine
-- `dom/` — DOM bindings and event system
-- `image/` — Image codecs (JPEG, PNG, GIF)
-- `network/` — HTTP client, networking
-- `storage/` — Web Storage, cookies
-- `security/` — Permissions, sandboxing
-- `wasm/` — WebAssembly runtime
-- `canvas/` — Canvas 2D API
-- `gl/` — OpenGL abstraction layer
-- `host/` — Platform host implementations
-- `platform/` — OS-specific abstractions
-- `malibu-shell/` — Standalone browser shell
-- `malibu-view/` — Embeddable view widget
-- `malibu-browser/` — Full browser application
-- `malibu-electron/` — Electron integration
-- `malibu-cef/` — CEF integration
-- `malibu-app-runtime/` — Application runtime
-- `tests/` — Unit and integration tests
-- `tools/` — CLI utilities
-- `examples/` — Example applications
-
-## License
-
-[Specify your license here]
