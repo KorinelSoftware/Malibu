@@ -26,6 +26,8 @@ public:
 
     // Parses, compiles, and runs `source`. Returns the completion value.
     EvalResult evaluate(std::string_view source, std::string_view filename = "<eval>");
+    EvalResult evaluate_module(std::string_view source,
+                               std::string_view filename = "<module>");
 
     // Convenience: evaluate and return the completion value as a string.
     std::string eval_to_string(std::string_view source);
@@ -47,6 +49,10 @@ public:
     void set_console_sink(runtime::ConsoleSink* sink) { interp_.set_console_sink(sink); }
 
 private:
+    EvalResult evaluate_impl(std::string_view source,
+                             std::string_view filename,
+                             bool isolated_top_level);
+
     heap::Heap                                              heap_;
     event_loop::EventLoop                                   loop_;
     runtime::Interpreter                                    interp_;

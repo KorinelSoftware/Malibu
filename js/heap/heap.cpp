@@ -27,6 +27,8 @@ void Heap::trace(HeapObject* obj, std::vector<HeapObject*>& worklist) {
     };
     switch (obj->kind) {
         case HeapObject::kJSString:
+        case HeapObject::kJSBigInt:
+        case HeapObject::kJSSymbol:
             break;  // no outgoing JS-heap edges
         case HeapObject::kDomNodeRef: {
             auto* d = static_cast<malibu::js::vm::DomNodeRef*>(obj);
@@ -61,7 +63,8 @@ void Heap::trace(HeapObject* obj, std::vector<HeapObject*>& worklist) {
         case HeapObject::kJSFunction: {
             auto* f = static_cast<JSFunction*>(obj);
             if (f->closure) mark_value(Value::make_heap_ptr(f->closure), worklist);
-            for (auto& p : f->props) mark_value(p.value, worklist);
+            for (auto& p : f->props) mark_prop(p, worklist);
+            if (f->proto) mark_value(Value::make_heap_ptr(f->proto), worklist);
             break;
         }
         case HeapObject::kJSMap: {

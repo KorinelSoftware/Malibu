@@ -37,6 +37,8 @@ struct HeapObject {
         kTypedArray   = 11, // Int8Array .. Float64Array (view over an ArrayBuffer)
         kDataView     = 12, // DataView (typed get/set over an ArrayBuffer)
         kJSProxy      = 13, // Proxy (target + handler with traps)
+        kJSBigInt     = 14, // Arbitrary-precision ECMAScript bigint primitive
+        kJSSymbol     = 15, // ECMAScript symbol primitive
     };
     Kind     kind     = kJSObject;
     GCColor  gc_color = GCColor::White;

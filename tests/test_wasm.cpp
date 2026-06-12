@@ -27,6 +27,24 @@ std::optional<int32_t> run_i32(const std::vector<uint8_t>& bytes, const char* fn
     if (!rets || rets->empty()) return std::nullopt;
     return (*rets)[0].i32;
 }
+
+std::vector<uint8_t> memory_module(std::vector<uint8_t> code) {
+    std::vector<uint8_t> body = {0x00};  // no locals
+    body.insert(body.end(), code.begin(), code.end());
+    std::vector<uint8_t> module = {
+        0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+        0x01,0x04,0x01, 0x60,0x00,0x00,             // type: () -> ()
+        0x03,0x02,0x01,0x00,                         // one function
+        0x05,0x03,0x01,0x00,0x01,                    // one-page memory
+        0x07,0x07,0x01, 0x03,'r','u','n',0x00,0x00,  // export function
+        0x0a,
+    };
+    module.push_back(static_cast<uint8_t>(body.size() + 2));
+    module.push_back(0x01);
+    module.push_back(static_cast<uint8_t>(body.size()));
+    module.insert(module.end(), body.begin(), body.end());
+    return module;
+}
 }  // namespace
 
 TEST(MalibuWASM, Slice1_AddTwoNumbers) {
@@ -40,6 +58,137 @@ TEST(MalibuWASM, Slice1_AddTwoNumbers) {
 TEST(MalibuWASM, DecodeRejectsGarbage) {
     std::vector<uint8_t> junk = {0x01, 0x02, 0x03, 0x04};
     EXPECT_FALSE(decode(junk.data(), junk.size()).ok());
+}
+
+TEST(MalibuWASM, DecodesExportedReferenceTableLimits) {
+    const std::vector<uint8_t> module = {
+        0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+        0x04,0x05,0x01, 0x6f,0x01,0x02,0x04,
+        0x07,0x09,0x01, 0x05,'t','a','b','l','e', 0x01,0x00,
+    };
+    auto decoded = decode(module.data(), module.size());
+    ASSERT_TRUE(decoded.ok()) << decoded.error;
+    ASSERT_EQ(decoded.module->tables.size(), 1u);
+    EXPECT_EQ(decoded.module->tables[0].element_type, 0x6f);
+    EXPECT_EQ(decoded.module->tables[0].min_size, 2u);
+    EXPECT_TRUE(decoded.module->tables[0].has_max);
+    EXPECT_EQ(decoded.module->tables[0].max_size, 4u);
+    ASSERT_EQ(decoded.module->exports.size(), 1u);
+    EXPECT_EQ(decoded.module->exports[0].kind, 1);
+    EXPECT_EQ(decoded.module->exports[0].index, 0u);
+}
+
+TEST(MalibuWASM, ExecutesMvpMemoryLoadsAndStores) {
+    std::vector<uint8_t> code = {
+        0x41,0x00, 0x43,0x00,0x00,0x60,0x40, 0x38,0x02,0x00,
+        0x41,0x08, 0x44,0x00,0x00,0x00,0x00,0x00,0x00,0x1d,0xc0,
+        0x39,0x03,0x00,
+        0x41,0x10, 0x42,0x2a, 0x37,0x03,0x00,
+        0x41,0x18, 0x41,0x7f, 0x3b,0x01,0x00,
+        0x41,0x20, 0x42,0x7f, 0x3e,0x02,0x00,
+        0x41,0x00, 0x2a,0x02,0x00, 0x1a,
+        0x41,0x08, 0x2b,0x03,0x00, 0x1a,
+        0x41,0x10, 0x29,0x03,0x00, 0x1a,
+        0x41,0x18, 0x2e,0x01,0x00, 0x1a,
+        0x41,0x20, 0x35,0x02,0x00, 0x1a,
+        0x0b,
+    };
+    auto bytes = memory_module(std::move(code));
+    auto decoded = decode(bytes.data(), bytes.size());
+    ASSERT_TRUE(decoded.ok()) << decoded.error;
+    std::string error;
+    auto instance = instantiate(*decoded.module, {}, error);
+    ASSERT_NE(instance, nullptr) << error;
+    int function = instance->export_func("run");
+    ASSERT_GE(function, 0);
+    auto result = instance->invoke(static_cast<uint32_t>(function), {}, error);
+    ASSERT_TRUE(result.has_value()) << error;
+    EXPECT_TRUE(result->empty());
+
+    const auto& memory = instance->memory().data;
+    EXPECT_EQ(memory[0], 0x00);
+    EXPECT_EQ(memory[1], 0x00);
+    EXPECT_EQ(memory[2], 0x60);
+    EXPECT_EQ(memory[3], 0x40);
+    EXPECT_EQ(memory[8], 0x00);
+    EXPECT_EQ(memory[14], 0x1d);
+    EXPECT_EQ(memory[15], 0xc0);
+    EXPECT_EQ(memory[16], 42);
+    EXPECT_EQ(memory[24], 0xff);
+    EXPECT_EQ(memory[25], 0xff);
+    EXPECT_EQ(memory[32], 0xff);
+    EXPECT_EQ(memory[35], 0xff);
+}
+
+TEST(MalibuWASM, AppliesActiveDataSegmentsDuringInstantiation) {
+    const std::vector<uint8_t> module = {
+        0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+        0x05,0x03,0x01,0x00,0x01,
+        0x0b,0x09,0x01,0x00,0x41,0x04,0x0b,0x03,'a','b','c',
+    };
+    auto decoded = decode(module.data(), module.size());
+    ASSERT_TRUE(decoded.ok()) << decoded.error;
+    ASSERT_EQ(decoded.module->data_segments.size(), 1u);
+    std::string error;
+    auto instance = instantiate(*decoded.module, {}, error);
+    ASSERT_NE(instance, nullptr) << error;
+    ASSERT_GE(instance->memory().data.size(), 7u);
+    EXPECT_EQ(instance->memory().data[3], 0);
+    EXPECT_EQ(instance->memory().data[4], 'a');
+    EXPECT_EQ(instance->memory().data[5], 'b');
+    EXPECT_EQ(instance->memory().data[6], 'c');
+}
+
+TEST(MalibuWASM, DispatchesCallIndirectThroughActiveElementSegment) {
+    const std::vector<uint8_t> module = {
+        0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+        0x01,0x05,0x01,0x60,0x00,0x01,0x7f,
+        0x03,0x03,0x02,0x00,0x00,
+        0x04,0x04,0x01,0x70,0x00,0x01,
+        0x07,0x07,0x01,0x03,'r','u','n',0x00,0x01,
+        0x09,0x07,0x01,0x00,0x41,0x00,0x0b,0x01,0x00,
+        0x0a,0x0e,0x02,
+        0x04,0x00,0x41,0x2a,0x0b,
+        0x07,0x00,0x41,0x00,0x11,0x00,0x00,0x0b,
+    };
+    auto result = run_i32(module, "run", {});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 42);
+}
+
+TEST(MalibuWASM, ReferenceNullReportsAsNull) {
+    const std::vector<uint8_t> module = {
+        0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+        0x01,0x05,0x01,0x60,0x00,0x01,0x7f,
+        0x03,0x02,0x01,0x00,
+        0x07,0x0a,0x01,0x06,'i','s','N','u','l','l',0x00,0x00,
+        0x0a,0x07,0x01,0x05,0x00,0xd0,0x6f,0xd1,0x0b,
+    };
+    auto result = run_i32(module, "isNull", {});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1);
+}
+
+TEST(MalibuWASM, BranchTableSelectsNestedLabelDepth) {
+    const std::vector<uint8_t> module = {
+        0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+        0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,
+        0x03,0x02,0x01,0x00,
+        0x07,0x0a,0x01,0x06,'b','r','a','n','c','h',0x00,0x00,
+        0x0a,0x1c,0x01,0x1a,
+        0x01,0x01,0x7f,
+        0x41,0x09,0x21,0x01,
+        0x02,0x40,
+          0x02,0x40,
+            0x20,0x00,0x0e,0x01,0x00,0x01,
+          0x0b,
+          0x41,0x01,0x21,0x01,
+        0x0b,
+        0x20,0x01,0x0b,
+    };
+    EXPECT_EQ(*run_i32(module, "branch", {Value::I32(0)}), 1);
+    EXPECT_EQ(*run_i32(module, "branch", {Value::I32(1)}), 9);
+    EXPECT_EQ(*run_i32(module, "branch", {Value::I32(20)}), 9);
 }
 
 // fac(n): iterative factorial using a loop + br_if (exercises control flow).

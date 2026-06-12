@@ -92,6 +92,31 @@ TEST(Storage, CookieSameSiteStrictNotSentCrossSite) {
     EXPECT_EQ(eng.cookies().get_cookies("https://a.example.com/", same).size(), 1u);
 }
 
+TEST(Storage, DocumentCookieParsesAttributesAndRejectsForeignDomains) {
+    StorageEngine eng;
+    EXPECT_TRUE(eng.cookies().set_cookie_from_document(
+        "https://a.example.com/account/page",
+        "theme=dark; Path=/; SameSite=Strict; Secure"));
+    EXPECT_EQ(eng.cookies().get_cookie_string(
+                  "https://a.example.com/other"),
+              "theme=dark");
+    EXPECT_FALSE(eng.cookies().set_cookie_from_document(
+        "https://a.example.com/", "stolen=1; Domain=evil.example"));
+    EXPECT_EQ(eng.cookies().size(), 1u);
+}
+
+TEST(Storage, DocumentCookieMaxAgeDeletesMatchingCookie) {
+    StorageEngine eng;
+    EXPECT_TRUE(eng.cookies().set_cookie_from_document(
+        "https://a.example.com/", "temporary=1; Path=/"));
+    EXPECT_EQ(eng.cookies().get_cookie_string("https://a.example.com/"),
+              "temporary=1");
+    EXPECT_TRUE(eng.cookies().set_cookie_from_document(
+        "https://a.example.com/", "temporary=gone; Path=/; Max-Age=0"));
+    EXPECT_TRUE(
+        eng.cookies().get_cookie_string("https://a.example.com/").empty());
+}
+
 TEST(Storage, ClearOriginRemovesAllTypes) {
     StorageEngine eng;
     eng.local_storage(A()).set_item("k", "v");

@@ -101,13 +101,24 @@ DecodedImage decode_jpeg(const uint8_t* data, size_t len) {
     return out;
 }
 
-// Detects the format by magic and decodes (PNG / JPEG / WebP).
+// Detects the format by magic and decodes (PNG / JPEG / WebP / SVG / GIF).
 DecodedImage decode_image(const uint8_t* data, size_t len) {
     if (len >= 8 && data[0] == 0x89 && data[1] == 0x50) return decode_png(data, len);   // \x89PNG
     if (len >= 2 && data[0] == 0xFF && data[1] == 0xD8) return decode_jpeg(data, len);  // JPEG SOI
     if (len >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
         data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P')          // RIFF....WEBP
         return decode_webp(data, len);
+    if (len >= 6 && data[0] == 'G' && data[1] == 'I' && data[2] == 'F' && data[3] == '8' &&
+        (data[4] == '7' || data[4] == '9') && data[5] == 'a')                            // GIF87a / GIF89a
+        return decode_gif(data, len);
+    if (len >= 4) {
+        if (data[0] == '<' && data[1] == 's' && data[2] == 'v' && data[3] == 'g') return decode_svg(data, len, 100, 100); // <svg
+        if (data[0] == '<' && data[1] == '?' && data[2] == 'x' && data[3] == 'm') {
+            size_t svg_pos = 0;
+            while (svg_pos + 4 < len && !(data[svg_pos] == '<' && data[svg_pos+1] == 's' && data[svg_pos+2] == 'v' && data[svg_pos+3] == 'g')) svg_pos++;
+            if (svg_pos + 4 < len) return decode_svg(data + svg_pos, len - svg_pos, 100, 100); // <?xml ... <svg
+        }
+    }
     return decode_png(data, len);  // best effort
 }
 

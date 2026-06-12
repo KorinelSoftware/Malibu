@@ -8,6 +8,7 @@
 #include "malibu/dom/document.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace malibu::render {
 
@@ -18,6 +19,10 @@ using malibu::css::ComputedStyle;
 void DisplayList::sort() {
     std::stable_sort(items_.begin(), items_.end(),
                      [](const DisplayItem& a, const DisplayItem& b) {
+                         if (a.stacking_key != b.stacking_key)
+                             return std::lexicographical_compare(
+                                 a.stacking_key.begin(), a.stacking_key.end(),
+                                 b.stacking_key.begin(), b.stacking_key.end());
                          if (a.z_index != b.z_index) return a.z_index < b.z_index;
                          return a.document_order < b.document_order;
                      });
@@ -36,8 +41,19 @@ struct Ctx {
     uint32_t     order = 0;
 };
 
-void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& xform, ClipRect clip) {
+std::vector<int64_t> normal_key(const std::vector<int64_t>& context,
+                                uint32_t order) {
+    std::vector<int64_t> key = context;
+    key.push_back(0);
+    key.push_back(static_cast<int64_t>(order));
+    return key;
+}
+
+void emit_box(Ctx& ctx, const LayoutBox* box, float opacity,
+              const Transform2D& xform, ClipRect clip,
+              const std::vector<int64_t>& parent_context) {
     const ComputedStyle* s = box->style;
+    const uint32_t box_order = ctx.order;
     float local_opacity = opacity * (s ? s->opacity : 1.0f);
     // position:fixed is pinned to the viewport (ignores the scroll translate in
     // `xform`); position:sticky scrolls normally but clamps so its top never goes
@@ -50,6 +66,23 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
     }
     Transform2D local_xform = (s && !s->transform.is_identity()) ? mul(base, s->transform) : base;
     int32_t z = (s && s->has_z_index) ? s->z_index : 0;
+    const bool establishes_context =
+        s && (s->has_z_index || s->opacity < 1.0f ||
+              !s->transform.is_identity() ||
+              s->position == malibu::css::PositionType::Fixed ||
+              s->position == malibu::css::PositionType::Sticky);
+    std::vector<int64_t> context = parent_context;
+    if (establishes_context) {
+        context.push_back(static_cast<int64_t>(z));
+        context.push_back(static_cast<int64_t>(box_order));
+    }
+    std::vector<int64_t> box_background_key =
+        establishes_context ? context : normal_key(parent_context, box_order);
+    if (establishes_context)
+        box_background_key.push_back(std::numeric_limits<int64_t>::min());
+    const std::vector<int64_t> box_content_key =
+        establishes_context ? normal_key(context, box_order)
+                            : normal_key(parent_context, box_order);
 
     if (box->type != BoxType::Text && s) {
         bool visible = s->visibility == malibu::css::VisibilityType::Visible;
@@ -65,6 +98,7 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
         if (visible && s->has_box_shadow && s->shadow_color.a > 0) {
             DisplayItem sh;
             sh.kind = DisplayItem::Kind::Rect; sh.z_index = z; sh.document_order = ctx.order;
+            sh.stacking_key = box_background_key;
             sh.opacity = local_opacity; sh.transform = local_xform; sh.clip = clip;
             float sp = s->shadow_spread, bl = s->shadow_blur;
             sh.rect.x = bx + s->shadow_x - sp - bl; sh.rect.y = by + s->shadow_y - sp - bl;
@@ -79,6 +113,7 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
             item.kind = DisplayItem::Kind::Rect;
             item.z_index = z;
             item.document_order = ctx.order;
+            item.stacking_key = box_background_key;
             item.opacity = local_opacity;
             item.transform = local_xform;
             item.clip = clip;
@@ -102,12 +137,14 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
         auto emit_line = [&](const std::u16string& str, float x, float y, float w) {
             DisplayItem it;
             it.kind = DisplayItem::Kind::Text; it.z_index = z; it.document_order = ctx.order;
+            it.stacking_key = box_content_key;
             it.opacity = local_opacity; it.transform = local_xform; it.clip = clip;
             it.text.x = x; it.text.y = y; it.text.text = str; it.text.color = tcol; it.text.font_size = fs;
             ctx.list->add(std::move(it));
             if (td != malibu::css::TextDecoration::None && w > 0) {
                 DisplayItem ul;
                 ul.kind = DisplayItem::Kind::Rect; ul.z_index = z; ul.document_order = ctx.order;
+                ul.stacking_key = box_content_key;
                 ul.opacity = local_opacity; ul.transform = local_xform; ul.clip = clip;
                 float yoff = (td == malibu::css::TextDecoration::Overline) ? 0.05f
                            : (td == malibu::css::TextDecoration::LineThrough) ? 0.55f : 0.92f;
@@ -136,6 +173,7 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
         DisplayItem m;
         m.kind = DisplayItem::Kind::Text;
         m.z_index = z; m.document_order = ctx.order; m.opacity = local_opacity;
+        m.stacking_key = box_content_key;
         m.transform = local_xform; m.clip = clip;
         m.text.x = box->x - s->font_size * 1.3f;
         m.text.y = box->y;
@@ -158,7 +196,8 @@ void emit_box(Ctx& ctx, const LayoutBox* box, float opacity, const Transform2D& 
                               box->height + box->padding[0] + box->padding[2]};
     }
     for (const LayoutBox* child : box->children)
-        emit_box(ctx, child, local_opacity, local_xform, child_clip);
+        emit_box(ctx, child, local_opacity, local_xform, child_clip,
+                 establishes_context ? context : parent_context);
 }
 
 }  // namespace
@@ -170,7 +209,9 @@ DisplayList DisplayListBuilder::build(malibu::dom::Document& /*doc*/, malibu::la
     Ctx ctx{&list, 0};
     ClipRect none;
     Transform2D scroll{1, 0, 0, 1, 0, -scroll_y};   // translate content up by scroll_y
-    for (const LayoutBox* child : root->children) emit_box(ctx, child, 1.0f, scroll, none);
+    const std::vector<int64_t> root_context;
+    for (const LayoutBox* child : root->children)
+        emit_box(ctx, child, 1.0f, scroll, none, root_context);
     list.sort();
     if (std::getenv("MALIBU_DL_DEBUG")) {
         int texts = 0, rects = 0, shown = 0;
@@ -179,8 +220,8 @@ DisplayList DisplayListBuilder::build(malibu::dom::Document& /*doc*/, malibu::la
                 texts++;
                 if (!it.text.text.empty() && shown < 400) {
                     std::string s; for (char16_t ch : it.text.text) if (s.size() < 30) s.push_back(ch < 128 ? (char)ch : '?');
-                    std::fprintf(stderr, "TEXT @x=%.0f y=%.0f fs=%.1f op=%.2f clip[%d %.0f,%.0f %.0fx%.0f] col=%d,%d,%d \"%s\"\n",
-                        it.text.x, it.text.y, it.text.font_size, it.opacity,
+                    std::fprintf(stderr, "TEXT z=%d order=%u @x=%.0f y=%.0f fs=%.1f op=%.2f clip[%d %.0f,%.0f %.0fx%.0f] col=%d,%d,%d \"%s\"\n",
+                        it.z_index, it.document_order, it.text.x, it.text.y, it.text.font_size, it.opacity,
                         it.clip.active, it.clip.x, it.clip.y, it.clip.w, it.clip.h,
                         it.text.color.r, it.text.color.g, it.text.color.b, s.c_str());
                     shown++;
@@ -189,8 +230,8 @@ DisplayList DisplayListBuilder::build(malibu::dom::Document& /*doc*/, malibu::la
                 rects++;
                 const auto& r = it.rect;
                 if (std::getenv("MALIBU_DL_RECTS") && r.w > 200 && r.h > 40 && r.background.a > 40 && !r.shadow) {
-                    std::fprintf(stderr, "RECT @x=%.0f y=%.0f %.0fx%.0f bg=%d,%d,%d,%d grad=%d\n",
-                        r.x + it.transform.e, r.y + it.transform.f, r.w, r.h,
+                    std::fprintf(stderr, "RECT z=%d order=%u @x=%.0f y=%.0f %.0fx%.0f bg=%d,%d,%d,%d grad=%d\n",
+                        it.z_index, it.document_order, r.x + it.transform.e, r.y + it.transform.f, r.w, r.h,
                         r.background.r, r.background.g, r.background.b, r.background.a, r.gradient);
                 }
             }

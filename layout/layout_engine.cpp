@@ -79,7 +79,15 @@ LayoutBox* LayoutEngine::box_for_node(malibu::NodeHandle h) const {
 
 void LayoutEngine::set_replaced_intrinsic_size(malibu::NodeHandle h,
                                                float width, float height) {
-    if (width <= 0 || height <= 0) return;
+    if (width <= 0 || height <= 0) {
+        if (std::getenv("MALIBU_TRACE_SCRIPTS"))
+            std::fprintf(stderr, "[layout] SKIP intrinsic size: %.0fx%.0f for node %u.%u\n",
+                        width, height, h.index, h.generation);
+        return;
+    }
+    if (std::getenv("MALIBU_TRACE_SCRIPTS"))
+        std::fprintf(stderr, "[layout] SET intrinsic size: %.0fx%.0f key=%llx node=%u.%u\n",
+                    width, height, (unsigned long long)key(h), h.index, h.generation);
     replaced_intrinsic_sizes_[key(h)] = {width, height};
     needs_layout_ = true;
 }
@@ -139,6 +147,17 @@ LayoutBox* LayoutEngine::build_box(Document& doc, malibu::NodeHandle node) {
                           c->tag_name == u"img" ||
                           c->tag_name == u"video";
     box->is_replaced = replaced;
+    if (replaced && std::getenv("MALIBU_TRACE_SCRIPTS")) {
+        auto it = replaced_intrinsic_sizes_.find(key(node));
+        std::fprintf(stderr, "[layout] build_box %s key=%llx has_size=%d iw=%.0f ih=%.0f\n",
+                    std::string(c->tag_name.begin(), c->tag_name.end()).c_str(),
+                    (unsigned long long)key(node),
+                    (int)(it != replaced_intrinsic_sizes_.end()),
+                    it != replaced_intrinsic_sizes_.end() ? it->second.width : 0,
+                    it != replaced_intrinsic_sizes_.end() ? it->second.height : 0);
+    }
+    if (!replaced && c->tag_name == u"figure" && std::getenv("MALIBU_TRACE_SCRIPTS"))
+        std::fprintf(stderr, "[layout] build_box figure type=%d display=%d\n", (int)box->type, style ? (int)style->display : -1);
     if (auto it = replaced_intrinsic_sizes_.find(key(node));
         it != replaced_intrinsic_sizes_.end()) {
         box->intrinsic_width = it->second.width;
@@ -380,7 +399,17 @@ float LayoutEngine::layout_inline_run(const std::vector<LayoutBox*>& items, Layo
     };
 
     for (LayoutBox* item : items) flow(item, base_fs, base_lh);
-    return (line_top + line_max_h) - origin_y;
+    float total_h = (line_top + line_max_h) - origin_y;
+    if (std::getenv("MALIBU_TRACE_SCRIPTS")) {
+        std::string ctag = "?";
+        if (container->node.index) {
+            if (const auto* cc = doc_->core(container->node))
+                ctag = std::string(cc->tag_name.begin(), cc->tag_name.end());
+        }
+        std::fprintf(stderr, "[layout] ir %s cx=%.0f cw=%.0f ox=%.0f lt=%.0f lh=%.0f th=%.0f n=%zu\n",
+                    ctag.c_str(), container->x, container->width, origin_x, line_top, line_max_h, total_h, items.size());
+    }
+    return total_h;
 }
 
 void LayoutEngine::layout_block(LayoutBox* box, float cb_width) {
@@ -949,7 +978,7 @@ void LayoutEngine::layout_table(LayoutBox* box) {
         }
     };
     collect(box);
-    if (rows.empty()) { box->height = compute_height(box, 0.0f, viewport_w_, viewport_h_); return; }
+    if (rows.empty()) { float chh = layout_children(box); box->height = compute_height(box, chh, viewport_w_, viewport_h_); return; }
 
     size_t ncols = 0;
     for (auto* r : rows) {
@@ -1054,7 +1083,7 @@ LayoutBox* LayoutEngine::layout_document(Document& doc, float viewport_width, fl
     if (std::getenv("MALIBU_LAYOUT_DEBUG")) {
         int count = 0;
         std::function<void(LayoutBox*, int)> dump = [&](LayoutBox* b, int depth) {
-            if (count++ > 400 || depth > 10) return;
+            if (count++ > 2000 || depth > 20) return;
             if (b->style && b->node.index) {
                 const NodeCore* c = doc.core(b->node);
                 std::string tag = c ? std::string(c->tag_name.begin(), c->tag_name.end()) : "?";

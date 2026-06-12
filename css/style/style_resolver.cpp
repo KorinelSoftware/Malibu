@@ -193,6 +193,252 @@ uint8_t hex_pair(char16_t a, char16_t b) {
     return static_cast<uint8_t>(h(a) * 16 + h(b));
 }
 
+float parse_calc_component(const std::u16string& value, bool percentage) {
+    std::u16string s = lower(trim(value));
+    if (s.rfind(u"calc(", 0) == 0) {
+        size_t rp = s.rfind(u')');
+        std::u16string inner =
+            s.substr(5, (rp == std::u16string::npos ? s.size() : rp) - 5);
+        CalcParser parser{inner};
+        Coeffs c = parser.expr();
+        if (percentage) return c.pct / 100.0f + c.num;
+        if (c.pct != 0.0f && c.num == 0.0f) return c.pct / 100.0f;
+        return c.num;
+    }
+    if (!s.empty() && s.back() == u'%')
+        return parse_float(s.substr(0, s.size() - 1)) / 100.0f;
+    return parse_float(s);
+}
+
+float parse_hue(const std::u16string& value) {
+    std::u16string s = lower(trim(value));
+    float hue = parse_float(s);
+    if (s.size() >= 4 && s.compare(s.size() - 4, 4, u"turn") == 0)
+        hue *= 360.0f;
+    else if (s.size() >= 4 && s.compare(s.size() - 4, 4, u"grad") == 0)
+        hue *= 0.9f;
+    else if (s.size() >= 3 && s.compare(s.size() - 3, 3, u"rad") == 0)
+        hue *= 180.0f / 3.14159265358979323846f;
+    hue = std::fmod(hue, 360.0f);
+    return hue < 0.0f ? hue + 360.0f : hue;
+}
+
+uint8_t color_byte(float component) {
+    return static_cast<uint8_t>(std::lround(std::clamp(component, 0.0f, 1.0f) * 255.0f));
+}
+
+std::optional<Color> parse_hsl_function(const std::u16string& source) {
+    size_t lp = source.find(u'('), rp = source.rfind(u')');
+    if (lp == std::u16string::npos || rp == std::u16string::npos || rp <= lp)
+        return std::nullopt;
+    std::u16string args = source.substr(lp + 1, rp - lp - 1);
+
+    std::vector<std::u16string> components;
+    std::u16string alpha;
+    if (args.find(u',') != std::u16string::npos) {
+        components = split_commas(args);
+        if (components.size() == 4) {
+            alpha = components.back();
+            components.pop_back();
+        }
+    } else {
+        size_t slash = std::u16string::npos;
+        int depth = 0;
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == u'(') ++depth;
+            else if (args[i] == u')') --depth;
+            else if (args[i] == u'/' && depth == 0) { slash = i; break; }
+        }
+        std::u16string channels = slash == std::u16string::npos ? args : args.substr(0, slash);
+        components = split_tokens(channels);
+        if (slash != std::u16string::npos) alpha = trim(args.substr(slash + 1));
+    }
+    if (components.size() != 3) return std::nullopt;
+
+    float h = parse_hue(components[0]) / 360.0f;
+    float s = std::clamp(parse_calc_component(components[1], true), 0.0f, 1.0f);
+    float l = std::clamp(parse_calc_component(components[2], true), 0.0f, 1.0f);
+    auto hue_to_rgb = [](float p, float q, float t) {
+        if (t < 0.0f) t += 1.0f;
+        if (t > 1.0f) t -= 1.0f;
+        if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+        if (t < 1.0f / 2.0f) return q;
+        if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+        return p;
+    };
+    float r = l, g = l, b = l;
+    if (s > 0.0f) {
+        float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+        float p = 2.0f * l - q;
+        r = hue_to_rgb(p, q, h + 1.0f / 3.0f);
+        g = hue_to_rgb(p, q, h);
+        b = hue_to_rgb(p, q, h - 1.0f / 3.0f);
+    }
+    float a = alpha.empty() ? 1.0f
+                            : std::clamp(parse_calc_component(alpha, false), 0.0f, 1.0f);
+    if (!alpha.empty() && alpha.back() == u'%')
+        a = std::clamp(parse_calc_component(alpha, true), 0.0f, 1.0f);
+    return Color{color_byte(r), color_byte(g), color_byte(b), color_byte(a)};
+}
+
+std::optional<Color> parse_rgb_function(const std::u16string& source) {
+    size_t lp = source.find(u'('), rp = source.rfind(u')');
+    if (lp == std::u16string::npos || rp == std::u16string::npos || rp <= lp)
+        return std::nullopt;
+    std::u16string args = source.substr(lp + 1, rp - lp - 1);
+    std::vector<std::u16string> components;
+    std::u16string alpha;
+    if (args.find(u',') != std::u16string::npos) {
+        components = split_commas(args);
+        if (components.size() == 4) {
+            alpha = components.back();
+            components.pop_back();
+        }
+    } else {
+        size_t slash = std::u16string::npos;
+        int depth = 0;
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == u'(') ++depth;
+            else if (args[i] == u')') --depth;
+            else if (args[i] == u'/' && depth == 0) { slash = i; break; }
+        }
+        components = split_tokens(slash == std::u16string::npos ? args : args.substr(0, slash));
+        if (slash != std::u16string::npos) alpha = trim(args.substr(slash + 1));
+    }
+    if (components.size() != 3) return std::nullopt;
+    auto channel = [](const std::u16string& component) {
+        std::u16string c = trim(component);
+        if (!c.empty() && c.back() == u'%')
+            return std::clamp(parse_calc_component(c, true), 0.0f, 1.0f);
+        return std::clamp(parse_calc_component(c, false) / 255.0f, 0.0f, 1.0f);
+    };
+    float a = alpha.empty() ? 1.0f
+                            : std::clamp(parse_calc_component(alpha, false), 0.0f, 1.0f);
+    if (!alpha.empty() && alpha.back() == u'%')
+        a = std::clamp(parse_calc_component(alpha, true), 0.0f, 1.0f);
+    return Color{color_byte(channel(components[0])),
+                 color_byte(channel(components[1])),
+                 color_byte(channel(components[2])), color_byte(a)};
+}
+
+std::optional<Color> parse_color(const std::u16string& in,
+                                 const Color& current_color);
+
+struct OklabColor {
+    float l = 0.0f;
+    float a = 0.0f;
+    float b = 0.0f;
+};
+
+OklabColor srgb_to_oklab(Color color) {
+    auto linear = [](float c) {
+        return c <= 0.04045f ? c / 12.92f
+                             : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    };
+    float r = linear(color.r / 255.0f);
+    float g = linear(color.g / 255.0f);
+    float b = linear(color.b / 255.0f);
+    float l = std::cbrt(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b);
+    float m = std::cbrt(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b);
+    float s = std::cbrt(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b);
+    return {
+        0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
+        1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s,
+        0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s,
+    };
+}
+
+Color oklab_to_srgb(OklabColor color, float alpha) {
+    float l = color.l + 0.3963377774f * color.a + 0.2158037573f * color.b;
+    float m = color.l - 0.1055613458f * color.a - 0.0638541728f * color.b;
+    float s = color.l - 0.0894841775f * color.a - 1.2914855480f * color.b;
+    l = l * l * l;
+    m = m * m * m;
+    s = s * s * s;
+    float r =  4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s;
+    float g = -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s;
+    float b = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
+    auto gamma = [](float c) {
+        return c <= 0.0031308f ? 12.92f * c
+                              : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+    };
+    return {color_byte(gamma(r)), color_byte(gamma(g)), color_byte(gamma(b)),
+            color_byte(alpha)};
+}
+
+struct ColorStop {
+    Color color;
+    std::optional<float> weight;
+};
+
+std::optional<ColorStop> parse_color_stop(const std::u16string& source,
+                                          const Color& current_color) {
+    auto tokens = split_tokens(trim(source));
+    if (tokens.empty()) return std::nullopt;
+    std::optional<float> weight;
+    if (tokens.size() > 1 && !tokens.back().empty() &&
+        tokens.back().back() == u'%') {
+        weight = std::clamp(parse_calc_component(tokens.back(), true), 0.0f, 1.0f);
+        tokens.pop_back();
+    }
+    std::u16string color_text;
+    for (const auto& token : tokens) {
+        if (!color_text.empty()) color_text += u' ';
+        color_text += token;
+    }
+    auto color = parse_color(color_text, current_color);
+    if (!color) return std::nullopt;
+    return ColorStop{*color, weight};
+}
+
+std::optional<Color> parse_color_mix_function(const std::u16string& source,
+                                              const Color& current_color) {
+    size_t lp = source.find(u'('), rp = source.rfind(u')');
+    if (lp == std::u16string::npos || rp == std::u16string::npos || rp <= lp)
+        return std::nullopt;
+    auto parts = split_commas(source.substr(lp + 1, rp - lp - 1));
+    if (parts.size() != 3) return std::nullopt;
+    std::u16string method = lower(trim(parts[0]));
+    if (method.rfind(u"in ", 0) != 0) return std::nullopt;
+    method = trim(method.substr(3));
+    bool use_oklab = method.rfind(u"oklab", 0) == 0;
+    bool use_srgb = method.rfind(u"srgb", 0) == 0;
+    if (!use_oklab && !use_srgb) return std::nullopt;
+
+    auto first = parse_color_stop(parts[1], current_color);
+    auto second = parse_color_stop(parts[2], current_color);
+    if (!first || !second) return std::nullopt;
+    float w1 = first->weight.value_or(
+        second->weight ? 1.0f - *second->weight : 0.5f);
+    float w2 = second->weight.value_or(
+        first->weight ? 1.0f - *first->weight : 0.5f);
+    float sum = w1 + w2;
+    if (sum <= 0.0f) return Color{0, 0, 0, 0};
+    float alpha_multiplier = std::min(sum, 1.0f);
+    w1 /= sum;
+    w2 /= sum;
+
+    float a1 = first->color.a / 255.0f;
+    float a2 = second->color.a / 255.0f;
+    float alpha = a1 * w1 + a2 * w2;
+    if (alpha <= 0.0f) return Color{0, 0, 0, 0};
+    float p1 = a1 * w1 / alpha;
+    float p2 = a2 * w2 / alpha;
+    if (use_oklab) {
+        OklabColor c1 = srgb_to_oklab(first->color);
+        OklabColor c2 = srgb_to_oklab(second->color);
+        return oklab_to_srgb(
+            {c1.l * p1 + c2.l * p2, c1.a * p1 + c2.a * p2,
+             c1.b * p1 + c2.b * p2},
+            alpha * alpha_multiplier);
+    }
+    float r = first->color.r / 255.0f * p1 + second->color.r / 255.0f * p2;
+    float g = first->color.g / 255.0f * p1 + second->color.g / 255.0f * p2;
+    float b = first->color.b / 255.0f * p1 + second->color.b / 255.0f * p2;
+    return Color{color_byte(r), color_byte(g), color_byte(b),
+                 color_byte(alpha * alpha_multiplier)};
+}
+
 std::optional<Color> parse_color(const std::u16string& in, const Color& current_color) {
     std::u16string s = trim(in);
     std::u16string ls = lower(s);
@@ -206,20 +452,12 @@ std::optional<Color> parse_color(const std::u16string& in, const Color& current_
         if (h.size() == 8) return Color{hex_pair(h[0], h[1]), hex_pair(h[2], h[3]), hex_pair(h[4], h[5]), hex_pair(h[6], h[7])};
         return std::nullopt;
     }
-    if (ls.rfind(u"rgb", 0) == 0) {
-        size_t lp = s.find(u'('), rp = s.find(u')');
-        if (lp != std::u16string::npos && rp != std::u16string::npos) {
-            auto parts = split_commas(s.substr(lp + 1, rp - lp - 1));
-            if (parts.size() >= 3) {
-                Color c;
-                c.r = static_cast<uint8_t>(std::clamp(parse_float(parts[0]), 0.0f, 255.0f));
-                c.g = static_cast<uint8_t>(std::clamp(parse_float(parts[1]), 0.0f, 255.0f));
-                c.b = static_cast<uint8_t>(std::clamp(parse_float(parts[2]), 0.0f, 255.0f));
-                c.a = parts.size() >= 4 ? static_cast<uint8_t>(std::clamp(parse_float(parts[3]) * 255.0f, 0.0f, 255.0f)) : 255;
-                return c;
-            }
-        }
-    }
+    if (ls.rfind(u"rgb(", 0) == 0 || ls.rfind(u"rgba(", 0) == 0)
+        return parse_rgb_function(s);
+    if (ls.rfind(u"hsl(", 0) == 0 || ls.rfind(u"hsla(", 0) == 0)
+        return parse_hsl_function(s);
+    if (ls.rfind(u"color-mix(", 0) == 0)
+        return parse_color_mix_function(s, current_color);
     return std::nullopt;
 }
 
@@ -362,9 +600,13 @@ Transform2D parse_transform(const std::u16string& value, float font_size) {
     return result;
 }
 
-// Replace var(--name[, fallback]) using the element's resolved custom props.
-std::u16string substitute_vars(const std::u16string& value,
-                               const std::unordered_map<std::u16string, std::u16string>& props) {
+// Custom properties retain their token stream at computed-value time. Resolve
+// references only when a normal property consumes them, so forward references
+// are order-independent and cycles can invalidate the declaration correctly.
+std::optional<std::u16string> substitute_vars_impl(
+    const std::u16string& value,
+    const std::unordered_map<std::u16string, std::u16string>& props,
+    std::vector<std::u16string>& resolving) {
     if (value.find(u"var(") == std::u16string::npos) return value;
     std::u16string out;
     size_t i = 0;
@@ -377,17 +619,44 @@ std::u16string substitute_vars(const std::u16string& value,
                 else if (value[j] == u')') { if (--depth == 0) break; }
                 inner.push_back(value[j++]);
             }
-            i = (j < value.size()) ? j + 1 : value.size();
-            auto args = split_commas(inner);
-            std::u16string name = trim(args.empty() ? u"" : args[0]);
+            if (depth != 0) return std::nullopt;
+            i = j + 1;
+
+            size_t comma = std::u16string::npos;
+            int inner_depth = 0;
+            for (size_t k = 0; k < inner.size(); ++k) {
+                if (inner[k] == u'(') ++inner_depth;
+                else if (inner[k] == u')') --inner_depth;
+                else if (inner[k] == u',' && inner_depth == 0) {
+                    comma = k;
+                    break;
+                }
+            }
+            std::u16string name = trim(inner.substr(0, comma));
+            std::optional<std::u16string> replacement;
             auto it = props.find(name);
-            if (it != props.end()) out += substitute_vars(it->second, props);
-            else if (args.size() > 1) out += substitute_vars(trim(args[1]), props);
+            bool cyclic = std::find(resolving.begin(), resolving.end(), name) != resolving.end();
+            if (it != props.end() && !cyclic) {
+                resolving.push_back(name);
+                replacement = substitute_vars_impl(it->second, props, resolving);
+                resolving.pop_back();
+            }
+            if (!replacement && comma != std::u16string::npos)
+                replacement = substitute_vars_impl(trim(inner.substr(comma + 1)), props, resolving);
+            if (!replacement) return std::nullopt;
+            out += *replacement;
         } else {
             out.push_back(value[i++]);
         }
     }
     return out;
+}
+
+std::optional<std::u16string> substitute_vars(
+    const std::u16string& value,
+    const std::unordered_map<std::u16string, std::u16string>& props) {
+    std::vector<std::u16string> resolving;
+    return substitute_vars_impl(value, props, resolving);
 }
 
 // CSS <absolute-size> / <relative-size> keywords → px (medium = 16px, matching
@@ -489,10 +758,22 @@ void apply_property(ComputedStyle& s, const ComputedStyle& parent,
         } else { float r = parse_float(value); s.aspect_ratio = r > 0 ? r : 0.0f; }
     } else if (prop == u"grid-template-columns") {
         s.grid_template_columns = value;
-    } else if (prop == u"gap" || prop == u"grid-gap" || prop == u"column-gap" || prop == u"row-gap") {
-        // `gap` shorthand may carry "row col"; we model a single gap → take the first.
-        std::u16string g = value; auto sp = g.find(u' '); if (sp != std::u16string::npos) g = g.substr(0, sp);
-        s.gap = parse_length(g).resolve(s.font_size, 0, 16.0f, 0, 0);
+    } else if (prop == u"gap" || prop == u"grid-gap") {
+        // `gap` shorthand may carry "row col"; we model both.
+        std::u16string g = value;
+        size_t sp = g.find(u' ');
+        if (sp != std::u16string::npos) {
+            s.row_gap = parse_length(g.substr(0, sp)).resolve(s.font_size, 0, 16.0f, 0, 0);
+            s.column_gap = parse_length(g.substr(sp + 1)).resolve(s.font_size, 0, 16.0f, 0, 0);
+            s.gap = s.row_gap;
+        } else {
+            s.gap = s.row_gap = s.column_gap = parse_length(g).resolve(s.font_size, 0, 16.0f, 0, 0);
+        }
+    } else if (prop == u"row-gap") {
+        s.row_gap = parse_length(value).resolve(s.font_size, 0, 16.0f, 0, 0);
+        s.gap = s.row_gap;
+    } else if (prop == u"column-gap") {
+        s.column_gap = parse_length(value).resolve(s.font_size, 0, 16.0f, 0, 0);
     } else if (prop == u"position") {
         if (lv == u"relative") s.position = PositionType::Relative;
         else if (lv == u"absolute") s.position = PositionType::Absolute;
@@ -677,6 +958,48 @@ void apply_property(ComputedStyle& s, const ComputedStyle& parent,
             else s.flex.basis = Length::px(0);
         }
     }
+    else if (prop == u"align-content") {
+        s.flex.align_content = (lv == u"flex-start") ? AlignContent::FlexStart : (lv == u"flex-end") ? AlignContent::FlexEnd :
+                               (lv == u"center") ? AlignContent::Center : (lv == u"space-between") ? AlignContent::SpaceBetween :
+                               (lv == u"space-around") ? AlignContent::SpaceAround : (lv == u"space-evenly") ? AlignContent::SpaceEvenly :
+                               (lv == u"stretch") ? AlignContent::Stretch : AlignContent::Normal;
+    }
+    else if (prop == u"justify-items") {
+        s.justify_items = (lv == u"flex-start") ? JustifyItems::FlexStart : (lv == u"flex-end") ? JustifyItems::FlexEnd :
+                          (lv == u"center") ? JustifyItems::Center : (lv == u"baseline") ? JustifyItems::Baseline : JustifyItems::Stretch;
+    }
+    else if (prop == u"place-items") {
+        auto toks = split_tokens(value);
+        if (toks.size() >= 1) {
+            std::u16string a = lower(toks[0]);
+            s.flex.align_items = (a == u"flex-start") ? AlignItems::FlexStart : (a == u"flex-end") ? AlignItems::FlexEnd :
+                                 (a == u"center") ? AlignItems::Center : (a == u"baseline") ? AlignItems::Baseline : AlignItems::Stretch;
+        }
+        if (toks.size() >= 2) {
+            std::u16string j = lower(toks[1]);
+            s.justify_items = (j == u"flex-start") ? JustifyItems::FlexStart : (j == u"flex-end") ? JustifyItems::FlexEnd :
+                              (j == u"center") ? JustifyItems::Center : (j == u"baseline") ? JustifyItems::Baseline : JustifyItems::Stretch;
+        }
+    }
+    else if (prop == u"place-content") {
+        auto toks = split_tokens(value);
+        if (toks.size() >= 1) {
+            std::u16string a = lower(toks[0]);
+            s.flex.align_content = (a == u"flex-start") ? AlignContent::FlexStart : (a == u"flex-end") ? AlignContent::FlexEnd :
+                                   (a == u"center") ? AlignContent::Center : (a == u"space-between") ? AlignContent::SpaceBetween :
+                                   (a == u"space-around") ? AlignContent::SpaceAround : (a == u"space-evenly") ? AlignContent::SpaceEvenly :
+                                   (a == u"stretch") ? AlignContent::Stretch : AlignContent::Normal;
+        }
+        if (toks.size() >= 2) {
+            std::u16string j = lower(toks[1]);
+            s.flex.justify_content = (j == u"flex-end") ? JustifyContent::FlexEnd : (j == u"center") ? JustifyContent::Center :
+                                     (j == u"space-between") ? JustifyContent::SpaceBetween : (j == u"space-around") ? JustifyContent::SpaceAround :
+                                     (j == u"space-evenly") ? JustifyContent::SpaceEvenly : JustifyContent::FlexStart;
+        }
+    }
+    else if (prop == u"grid-template-rows") {
+        s.grid_template_rows = value;
+    }
 }
 
 void parse_inline_declarations(const std::u16string& style_attr,
@@ -824,14 +1147,15 @@ ComputedStyle StyleResolver::compute(Document& doc, malibu::NodeHandle node,
         if (it == winners.end() || e.wins_over(it->second)) winners[e.decl->property] = e;
     }
 
-    // Apply custom properties first (so var() resolves), then normal properties.
+    // Preserve custom-property token streams. They may refer to declarations
+    // that occur later in source/cascade order and are resolved when consumed.
     for (auto& [prop, e] : winners)
         if (prop.size() > 2 && prop[0] == u'-' && prop[1] == u'-')
-            style.custom_props[prop] = substitute_vars(e.decl->value, style.custom_props);
+            style.custom_props[prop] = e.decl->value;
     for (auto& [prop, e] : winners) {
         if (prop.size() > 2 && prop[0] == u'-' && prop[1] == u'-') continue;
-        std::u16string value = substitute_vars(e.decl->value, style.custom_props);
-        apply_property(style, parent, prop, value);
+        auto value = substitute_vars(e.decl->value, style.custom_props);
+        if (value) apply_property(style, parent, prop, *value);
     }
     if (style.svg_fill_current_color) style.svg_fill = style.color;
 

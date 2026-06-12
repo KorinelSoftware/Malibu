@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <gmpxx.h>
+
 #include "malibu/js/vm/value.h"
 
 namespace malibu::js::compiler { struct Function; }
@@ -30,6 +32,31 @@ struct JSString : HeapObject {
     explicit JSString(std::u16string s) : data(std::move(s)) { kind = kJSString; }
 };
 
+// BigInt is a primitive in ECMAScript. It is represented by an immutable
+// heap payload so it can retain arbitrary precision while still fitting in
+// the NaN-boxed Value representation.
+struct JSBigInt : HeapObject {
+    mpz_class value;
+    JSBigInt() { kind = kJSBigInt; }
+    explicit JSBigInt(mpz_class v) : value(std::move(v)) { kind = kJSBigInt; }
+};
+
+// Symbols are primitives with identity. `property_key` is the engine-internal
+// key used by computed property access; it is never exposed as the symbol's
+// description.
+struct JSSymbol : HeapObject {
+    std::u16string description;
+    std::u16string property_key;
+    std::u16string registry_key;
+    bool           registered = false;
+
+    JSSymbol() { kind = kJSSymbol; }
+    JSSymbol(std::u16string desc, std::u16string key)
+        : description(std::move(desc)), property_key(std::move(key)) {
+        kind = kJSSymbol;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Object — insertion-ordered string-keyed property map with a prototype link.
 // ---------------------------------------------------------------------------
@@ -42,6 +69,8 @@ struct Property {
     bool           is_accessor = false;
     Value          getter;
     Value          setter;
+    bool           writable = true;
+    bool           configurable = true;
 };
 
 struct JSObject : HeapObject {
@@ -61,7 +90,8 @@ struct JSObject : HeapObject {
     // Own-or-inherited property lookup (walks the prototype chain).
     Property*       resolve(std::u16string_view key);
     // Installs/updates an accessor (getter or setter) on this object.
-    void            define_accessor(std::u16string_view key, Value fn, bool is_setter);
+    void            define_accessor(std::u16string_view key, Value fn, bool is_setter,
+                                    bool enumerable = false);
 
     // Own-or-inherited get. Returns undefined if absent.
     Value get(std::u16string_view key) const;
@@ -77,7 +107,24 @@ struct JSObject : HeapObject {
 // ---------------------------------------------------------------------------
 struct JSArray : JSObject {
     std::vector<Value> elements;
+    // Empty means every element is present. Once an array becomes sparse this
+    // mirrors `elements`; 0 denotes an absent integer-indexed property.
+    std::vector<uint8_t> presence;
+    bool               length_writable = true;
     JSArray() { kind = kJSArray; }
+
+    [[nodiscard]] bool has_index(size_t index) const noexcept;
+    void append(Value value, bool present = true);
+    void resize_length(size_t length, bool new_indices_present = false);
+    void set_index(size_t index, Value value);
+    void delete_index(size_t index);
+    void erase_range(size_t start, size_t count);
+    void insert_dense(size_t start, const std::vector<Value>& values);
+    void reverse_elements();
+
+private:
+    void materialize_presence();
+    void normalize_presence();
 };
 
 // ---------------------------------------------------------------------------
@@ -88,7 +135,7 @@ struct Environment;
 
 using NativeFn = std::function<Value(Interpreter&, Value /*this*/, std::vector<Value>& /*args*/)>;
 
-struct JSFunction : HeapObject {
+struct JSFunction : JSObject {
     std::u16string             name;
     uint32_t                   arity = 0;
 
@@ -96,15 +143,10 @@ struct JSFunction : HeapObject {
     Environment*               closure = nullptr;
 
     NativeFn                   native;           // set => native function
-
-    std::vector<Property>      props;            // own properties (e.g. prototype)
+    bool                       constructable = true;
 
     JSFunction() { kind = kJSFunction; }
     [[nodiscard]] bool is_native() const noexcept { return static_cast<bool>(native); }
-
-    Property* find_own(std::u16string_view key);
-    Value     get(std::u16string_view key) const;
-    void      set(std::u16string_view key, Value v);
 };
 
 // ---------------------------------------------------------------------------
@@ -228,9 +270,10 @@ struct Environment : HeapObject {
         return this;
     }
 
-    Value* find(std::u16string_view name);              // searches the chain
-    void   define(std::u16string_view name, Value v);   // in this scope
-    bool   set(std::u16string_view name, Value v);      // assigns up the chain
+    Value* find(std::u16string_view name);                       // searches the chain
+    void   define(std::u16string_view name, Value v);            // in this scope
+    void   define_if_absent(std::u16string_view name, Value v);  // in this scope
+    bool   set(std::u16string_view name, Value v);               // assigns up the chain
     bool   has(std::u16string_view name) const;
 };
 

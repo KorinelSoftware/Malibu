@@ -52,6 +52,10 @@ struct DisplayItem {
     Kind        kind = Kind::Rect;
     int32_t     z_index = 0;
     uint32_t    document_order = 0;
+    // Lexicographic paint key. Each stacking context contributes
+    // (stack-level, context document order), preventing descendants from
+    // escaping their context while preserving order among equal levels.
+    std::vector<int64_t> stacking_key;
     float       opacity = 1.0f;
     Transform2D transform;
     ClipRect    clip;

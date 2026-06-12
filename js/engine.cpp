@@ -51,6 +51,14 @@ std::u16string widen(const std::string& s) {
     for (unsigned char c : s) r.push_back(static_cast<char16_t>(c));
     return r;
 }
+
+void set_source_name(const std::shared_ptr<compiler::Function>& function,
+                     std::string_view source_name) {
+    if (!function) return;
+    function->source_name.assign(source_name);
+    for (const auto& nested : function->functions)
+        set_source_name(nested, source_name);
+}
 }  // namespace
 
 Engine::Engine() : interp_(heap_) {
@@ -72,12 +80,15 @@ Engine::Engine() : interp_(heap_) {
         if (!compiled.ok()) {
             interp_.throw_error(u"SyntaxError", widen(compiled.error));
         }
+        set_source_name(compiled.function, "<eval>");
         programs_.push_back(compiled.function);
         return interp_.run_program(compiled.function.get());
     });
 }
 
-Engine::EvalResult Engine::evaluate(std::string_view source, std::string_view filename) {
+Engine::EvalResult Engine::evaluate_impl(std::string_view source,
+                                        std::string_view filename,
+                                        bool isolated_top_level) {
     EvalResult result;
 
     parser::Parser parser;
@@ -95,6 +106,7 @@ Engine::EvalResult Engine::evaluate(std::string_view source, std::string_view fi
         result.error = "compile error: " + compiled.error;
         return result;
     }
+    set_source_name(compiled.function, filename);
     programs_.push_back(compiled.function);
     if (std::getenv("MALIBU_BC")) {
         std::function<void(const compiler::Function*, int)> walk = [&](const compiler::Function* f, int d) {
@@ -108,7 +120,8 @@ Engine::EvalResult Engine::evaluate(std::string_view source, std::string_view fi
     }
 
     try {
-        result.value = interp_.run_program(compiled.function.get());
+        result.value = interp_.run_program(compiled.function.get(),
+                                           isolated_top_level);
         interp_.run_microtasks();  // settle synchronously-resolvable promises / async
         result.ok = true;
     } catch (runtime::ThrowSignal& sig) {
@@ -125,6 +138,16 @@ Engine::EvalResult Engine::evaluate(std::string_view source, std::string_view fi
         result.error = narrow(msg);
     }
     return result;
+}
+
+Engine::EvalResult Engine::evaluate(std::string_view source,
+                                   std::string_view filename) {
+    return evaluate_impl(source, filename, false);
+}
+
+Engine::EvalResult Engine::evaluate_module(std::string_view source,
+                                          std::string_view filename) {
+    return evaluate_impl(source, filename, true);
 }
 
 std::string Engine::eval_to_string(std::string_view source) {

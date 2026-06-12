@@ -143,6 +143,8 @@ private:
                                                     const std::u16string& name) {
         auto fn = std::make_shared<Function>();
         fn->name = name;
+        fn->source_line = node.line;
+        fn->source_column = node.column;
         fn->is_arrow = node.kind == NodeKind::ArrowFunction;
         fn->is_async = !isProgram && node.is_async;
         fn->is_generator = !isProgram && (node.flags & parser::node_flags::Generator);
@@ -239,6 +241,11 @@ private:
 
     // Hoist top-level `var` names and function declarations of a body.
     void hoist(const Node& body) {
+        // `var` bindings exist from function entry, but an uninitialized
+        // declaration at its source position is a no-op. Install the bindings
+        // before function declarations so a same-name function supplies the
+        // initial value, as required by declaration instantiation.
+        collect_vars(body);
         for (auto& stmt : body.children) {
             if (stmt->kind == NodeKind::FunctionDeclaration && !stmt->str.empty()) {
                 auto nested = compile_function_node(*stmt, false, u16(stmt->str));
@@ -252,7 +259,37 @@ private:
                 hoisted_fns_.insert(stmt.get());
             }
         }
-        collect_vars(body);
+    }
+    void collect_var_binding(const Node& binding) {
+        if (binding.kind == NodeKind::Identifier) {
+            uint8_t r = alloc();
+            emit(OpCode::LoadUndefined, r, 0, 0, 0);
+            emit(OpCode::DefineVar, 2, r, 0,
+                 static_cast<int16_t>(str_const(u16(binding.str))));
+            free_to(cur_->reg_top - 1);
+            return;
+        }
+        if (binding.kind == NodeKind::Assignment ||
+            binding.kind == NodeKind::Spread) {
+            if (!binding.children.empty())
+                collect_var_binding(*binding.children[0]);
+            return;
+        }
+        if (binding.kind == NodeKind::ArrayLiteral) {
+            for (auto& child : binding.children)
+                if (child->kind != NodeKind::UndefinedLiteral)
+                    collect_var_binding(*child);
+            return;
+        }
+        if (binding.kind == NodeKind::ObjectLiteral) {
+            for (auto& property : binding.children) {
+                if (property->kind == NodeKind::Spread) {
+                    collect_var_binding(*property);
+                } else if (!property->children.empty()) {
+                    collect_var_binding(*property->children[0]);
+                }
+            }
+        }
     }
     void collect_vars(const Node& n) {
         for (auto& c : n.children) {
@@ -260,12 +297,8 @@ private:
                 c->kind == NodeKind::ClassDeclaration)
                 continue;  // do not descend into nested functions / class bodies
             if (c->kind == NodeKind::VariableDeclaration && c->str == "var") {
-                for (auto& binding : c->children) {
-                    uint8_t r = alloc();
-                    emit(OpCode::LoadUndefined, r, 0, 0, 0);
-                    emit(OpCode::DefineVar, 1, r, 0, static_cast<int16_t>(str_const(u16(binding->str))));
-                    free_to(cur_->reg_top - 1);
-                }
+                for (auto& binding : c->children)
+                    collect_var_binding(*binding);
             }
             collect_vars(*c);
         }
@@ -364,6 +397,18 @@ private:
             emit(OpCode::SetFnName, dst, 0, 0, static_cast<int16_t>(str_const(name)));
     }
 
+    static std::u16string static_property_name(const Node& member) {
+        if (member.kind != NodeKind::Member) return {};
+        if (member.str != "[]") return u16(member.str);
+        if (member.children.size() < 2) return {};
+        const Node& key = *member.children[1];
+        if (key.kind == NodeKind::StringLiteral ||
+            key.kind == NodeKind::NumberLiteral ||
+            key.kind == NodeKind::BigIntLiteral)
+            return u16(key.str);
+        return {};
+    }
+
     void compile_var_decl(const Node& n) {
         bool is_var = n.str == "var";
         for (auto& binding : n.children) {
@@ -372,14 +417,20 @@ private:
                 int mark = cur_->reg_top;
                 uint8_t src = alloc();
                 compile_expr(*binding->children[1], src);
-                bind_pattern_or_target(*binding->children[0], src, /*declare*/true, is_var);
+                bind_pattern_or_target(*binding->children[0], src,
+                                       /*declare*/!is_var, is_var);
                 free_to(mark);
                 continue;
             }
+            // The binding was created during declaration instantiation. A bare
+            // `var name;` performs no assignment at this source position.
+            if (is_var && binding->children.empty())
+                continue;
             uint8_t r = alloc();
             if (!binding->children.empty()) compile_init_named(*binding->children[0], r, u16(binding->str));
             else emit(OpCode::LoadUndefined, r, 0, 0, 0);
-            emit(OpCode::DefineVar, is_var ? 1 : 0, r, 0,
+            emit(is_var ? OpCode::StoreVar : OpCode::DefineVar,
+                 is_var ? 0 : 0, r, 0,
                  static_cast<int16_t>(str_const(u16(binding->str))));
             free_to(cur_->reg_top - 1);
         }
@@ -428,7 +479,11 @@ private:
         emit(OpCode::ToIterable, src, srcv, 0, 0);
         int idx = 0;
         for (auto& el : pat.children) {
-            if (el->kind == NodeKind::UndefinedLiteral) { idx++; continue; }  // hole
+            if (el->kind == NodeKind::UndefinedLiteral ||
+                el->kind == NodeKind::ArrayHole) {
+                ++idx;
+                continue;
+            }
             if (el->kind == NodeKind::Spread) {
                 // rest = src.slice(idx)
                 int m = cur_->reg_top;
@@ -723,13 +778,19 @@ private:
         int jnormal = emit(OpCode::Jump, 0, 0, 0, 0);  // jump to finally/after
 
         int catch_pc = here();
+        int catch_finally_handler = -1;
         if (has_catch) {
+            if (has_finally)
+                catch_finally_handler =
+                    emit(OpCode::PushHandler, 2, 0, exc_reg, 0);
             emit(OpCode::PushScope, 0, 0, 0, 0);
             if (!catch_block->str.empty())
                 emit(OpCode::DefineVar, 0, exc_reg, 0,
                      static_cast<int16_t>(str_const(u16(catch_block->str))));
             compile_stmt(*catch_block);
             emit(OpCode::PopScope, 0, 0, 0, 0);
+            if (has_finally)
+                emit(OpCode::PopHandler, 0, 0, 0, 0);
         }
 
         int finally_pc = here();
@@ -746,6 +807,12 @@ private:
                                         static_cast<uint16_t>(finally_pc),
                                         exc_reg, static_cast<int16_t>(target_catch));
         }
+        if (catch_finally_handler >= 0) {
+            auto in = bytecode::decode(cur_->fn->code[catch_finally_handler]);
+            cur_->fn->code[catch_finally_handler] =
+                encode(in.op, 2, static_cast<uint16_t>(finally_pc),
+                       exc_reg, static_cast<int16_t>(finally_pc));
+        }
     }
 
     // ---- expressions (result written into reg `dst`) ----
@@ -757,6 +824,12 @@ private:
                                   ? vm::Value::make_int32(static_cast<int32_t>(d))
                                   : vm::Value::make_double(d);
                 emit(OpCode::LoadConst, dst, 0, 0, static_cast<int16_t>(num_const(v)));
+                break;
+            }
+            case NodeKind::BigIntLiteral: {
+                cur_->fn->bigint_consts.push_back(n.str);
+                emit(OpCode::LoadBigInt, dst, 0, 0,
+                     static_cast<int16_t>(cur_->fn->bigint_consts.size() - 1));
                 break;
             }
             case NodeKind::StringLiteral:
@@ -779,7 +852,11 @@ private:
                     break;
                 }
                 if (n.str == "undefined") { emit(OpCode::LoadUndefined, dst, 0, 0, 0); break; }
-                if (n.str == "super") throw CompileError{"'super' keyword unexpected here"};
+                if (n.str == "super")
+                    throw CompileError{
+                        "'super' keyword unexpected at " +
+                        std::to_string(n.line) + ":" +
+                        std::to_string(n.column)};
                 emit(OpCode::LoadVar, dst, 0, 0, static_cast<int16_t>(str_const(u16(n.str))));
                 break;
             }
@@ -831,6 +908,10 @@ private:
     void compile_array(const Node& n, uint8_t dst) {
         emit(OpCode::NewArray, dst, 0, 0, 0);
         for (auto& c : n.children) {
+            if (c->kind == NodeKind::ArrayHole) {
+                emit(OpCode::ArrayAppend, dst, 0, 0, 2);
+                continue;
+            }
             int mark = cur_->reg_top;
             uint8_t value = alloc();
             bool spread = c->kind == NodeKind::Spread;
@@ -856,13 +937,17 @@ private:
                 int mi = add_function(compile_function_node(*prop->children[0], false, u16(prop->str)));
                 emit(OpCode::NewClosure, fnreg, 0, 0, static_cast<int16_t>(mi));
                 bool is_setter = prop->flags & parser::node_flags::ClassSetter;
-                emit(OpCode::DefineAccessor, dst, fnreg, is_setter ? 1 : 0,
+                emit(OpCode::DefineAccessor, dst, fnreg, (is_setter ? 1 : 0) | 2,
                      static_cast<int16_t>(str_const(u16(prop->str))));
                 free_to(mark);
                 continue;
             }
             uint8_t rv = alloc();
-            if (!prop->children.empty()) compile_expr(*prop->children[0], rv);
+            if (!prop->children.empty() &&
+                !(prop->flags & parser::node_flags::Computed))
+                compile_init_named(*prop->children[0], rv, u16(prop->str));
+            else if (!prop->children.empty())
+                compile_expr(*prop->children[0], rv);
             else emit(OpCode::LoadUndefined, rv, 0, 0, 0);
             if (prop->flags & parser::node_flags::Computed && prop->children.size() > 1) {
                 uint8_t rk = alloc();
@@ -880,6 +965,21 @@ private:
         return n.kind == NodeKind::Identifier && n.str == "super";
     }
 
+    void compile_member_base(const Node& member, uint8_t dst,
+                             bool for_write) {
+        if (is_super(*member.children[0])) {
+            if (for_write) {
+                emit(OpCode::LoadThis, dst, 0, 0, 0);
+            } else {
+                emit(OpCode::LoadVar, dst, 0, 0,
+                     static_cast<int16_t>(
+                         str_const(u"%superproto%")));
+            }
+            return;
+        }
+        compile_expr(*member.children[0], dst);
+    }
+
     void emit_optional_guard(uint8_t value, std::vector<int>& short_circuits) {
         int mark = cur_->reg_top;
         uint8_t null_value = alloc();
@@ -894,8 +994,30 @@ private:
                                      std::vector<int>& short_circuits) {
         if (n.kind == NodeKind::Member) {
             int mark = cur_->reg_top;
+            if (is_super(*n.children[0])) {
+                uint8_t super_proto = alloc();
+                emit(OpCode::LoadVar, super_proto, 0, 0,
+                     static_cast<int16_t>(
+                         str_const(u"%superproto%")));
+                uint8_t receiver = alloc();
+                emit(OpCode::LoadThis, receiver, 0, 0, 0);
+                if (n.str == "[]") {
+                    uint8_t key = alloc();
+                    compile_expr(*n.children[1], key);
+                    emit(OpCode::GetSuperElem, dst, super_proto,
+                         receiver, static_cast<int16_t>(key));
+                } else {
+                    emit(OpCode::GetSuperProp, dst, super_proto,
+                         receiver,
+                         static_cast<int16_t>(
+                             str_const(u16(n.str))));
+                }
+                free_to(mark);
+                return;
+            }
             uint8_t object = alloc();
-            compile_optional_chain_link(*n.children[0], object, short_circuits);
+            compile_optional_chain_link(
+                *n.children[0], object, short_circuits);
             if (n.flags & parser::node_flags::Optional)
                 emit_optional_guard(object, short_circuits);
             if (n.str == "[]") {
@@ -917,9 +1039,29 @@ private:
             uint8_t callee = alloc();
             uint8_t this_value = alloc();
 
-            if (callee_node.kind == NodeKind::Member) {
+            if (callee_node.kind == NodeKind::Member &&
+                is_super(*callee_node.children[0])) {
+                emit(OpCode::LoadThis, this_value, 0, 0, 0);
+                uint8_t super_proto = alloc();
+                emit(OpCode::LoadVar, super_proto, 0, 0,
+                     static_cast<int16_t>(
+                         str_const(u"%superproto%")));
+                if (callee_node.str == "[]") {
+                    uint8_t key = alloc();
+                    compile_expr(*callee_node.children[1], key);
+                    emit(OpCode::GetSuperElem, callee, super_proto,
+                         this_value, static_cast<int16_t>(key));
+                } else {
+                    emit(OpCode::GetSuperProp, callee, super_proto,
+                         this_value,
+                         static_cast<int16_t>(
+                             str_const(u16(callee_node.str))));
+                }
+                free_to(static_cast<int>(super_proto));
+            } else if (callee_node.kind == NodeKind::Member) {
                 compile_optional_chain_link(
-                    *callee_node.children[0], this_value, short_circuits);
+                    *callee_node.children[0], this_value,
+                    short_circuits);
                 if (callee_node.flags & parser::node_flags::Optional)
                     emit_optional_guard(this_value, short_circuits);
                 if (callee_node.str == "[]") {
@@ -994,14 +1136,21 @@ private:
         int mark = cur_->reg_top;
         // super.prop / super[expr]: read off the superclass prototype.
         if (is_super(*n.children[0])) {
-            uint8_t robj = alloc();
-            emit(OpCode::LoadVar, robj, 0, 0, static_cast<int16_t>(str_const(u"%superproto%")));
+            uint8_t super_proto = alloc();
+            emit(OpCode::LoadVar, super_proto, 0, 0,
+                 static_cast<int16_t>(
+                     str_const(u"%superproto%")));
+            uint8_t receiver = alloc();
+            emit(OpCode::LoadThis, receiver, 0, 0, 0);
             if (n.str == "[]") {
                 uint8_t rkey = alloc();
                 compile_expr(*n.children[1], rkey);
-                emit(OpCode::GetElem, dst, robj, rkey, 0);
+                emit(OpCode::GetSuperElem, dst, super_proto, receiver,
+                     static_cast<int16_t>(rkey));
             } else {
-                emit(OpCode::GetProp, dst, robj, 0, static_cast<int16_t>(str_const(u16(n.str))));
+                emit(OpCode::GetSuperProp, dst, super_proto, receiver,
+                     static_cast<int16_t>(
+                         str_const(u16(n.str))));
             }
             free_to(mark);
             return;
@@ -1098,9 +1247,14 @@ private:
             if (callee.str == "[]") {
                 uint8_t rkey = alloc();
                 compile_expr(*callee.children[1], rkey);
-                emit(OpCode::GetElem, static_cast<uint8_t>(base), sproto, rkey, 0);
+                emit(OpCode::GetSuperElem,
+                     static_cast<uint8_t>(base), sproto,
+                     static_cast<uint8_t>(base + 1),
+                     static_cast<int16_t>(rkey));
             } else {
-                emit(OpCode::GetProp, static_cast<uint8_t>(base), sproto, 0,
+                emit(OpCode::GetSuperProp,
+                     static_cast<uint8_t>(base), sproto,
+                     static_cast<uint8_t>(base + 1),
                      static_cast<int16_t>(str_const(u16(callee.str))));
             }
             free_to(m2);
@@ -1234,7 +1388,8 @@ private:
     void compile_new(const Node& n, uint8_t dst) {
         const Node* callee = n.children.empty() ? nullptr : n.children[0].get();
         std::vector<const Node*> args;
-        if (callee && callee->kind == NodeKind::Call) {
+        if (callee && callee->kind == NodeKind::Call &&
+            !(callee->flags & parser::node_flags::Grouped)) {
             for (size_t i = 1; i < callee->children.size(); ++i) args.push_back(callee->children[i].get());
             callee = callee->children[0].get();
         }
@@ -1328,6 +1483,9 @@ private:
 
     void compile_closure_expr(const Node& n, uint8_t dst) {
         auto nested = compile_function_node(n, false, u16(n.str));
+        nested->has_name_binding =
+            n.kind == NodeKind::FunctionDeclaration &&
+            !n.str.empty();
         int fidx = static_cast<int>(cur_->fn->functions.size());
         cur_->fn->functions.push_back(nested);
         emit(OpCode::NewClosure, dst, 0, 0, static_cast<int16_t>(fidx));
@@ -1367,9 +1525,14 @@ private:
         uint8_t superReg = 0;
         if (has_super) { superReg = alloc(); compile_expr(heritage, superReg); }
 
-        // Scope holding %super% / %superproto% for closures to capture.
-        if (has_super) {
+        // Class definitions have a private lexical environment for their own
+        // name. Constructor/method closures and static initializers must all
+        // observe that binding before the outer declaration is initialized.
+        // The same scope also carries the lexical super bindings.
+        const bool has_class_scope = has_super || !n.str.empty();
+        if (has_class_scope)
             emit(OpCode::PushScope, 0, 0, 0, 0);
+        if (has_super) {
             emit(OpCode::DefineVar, 0, superReg, 0, static_cast<int16_t>(str_const(u"%super%")));
             uint8_t sproto = alloc();
             emit(OpCode::GetProp, sproto, superReg, 0, static_cast<int16_t>(str_const(u"prototype")));
@@ -1381,6 +1544,9 @@ private:
         int cfidx = add_function(compile_constructor(ctorFnNode, n.str, has_super, fields));
         uint8_t ctorReg = alloc();
         emit(OpCode::NewClosure, ctorReg, 0, 0, static_cast<int16_t>(cfidx));
+        if (!n.str.empty())
+            emit(OpCode::DefineVar, 0, ctorReg, 0,
+                 static_cast<int16_t>(str_const(u16(n.str))));
         uint8_t protoReg = alloc();
         emit(OpCode::GetProp, protoReg, ctorReg, 0, static_cast<int16_t>(str_const(u"prototype")));
 
@@ -1442,7 +1608,8 @@ private:
         }
 
         emit(OpCode::Move, dst, ctorReg, 0, 0);
-        if (has_super) emit(OpCode::PopScope, 0, 0, 0, 0);
+        if (has_class_scope)
+            emit(OpCode::PopScope, 0, 0, 0, 0);
         free_to(mark);
     }
 
@@ -1462,19 +1629,61 @@ private:
         // Anonymous classes start nameless so that named evaluation can fill it in
         // (`const C = class {}` => C.name === "C"); the empty name reads as "".
         fn->name = class_name.empty() ? u"" : u16(class_name);
+        if (ctorFnNode) {
+            fn->source_line = ctorFnNode->line;
+            fn->source_column = ctorFnNode->column;
+        }
 
         FnCtx ctx; ctx.fn = fn.get();
         FnCtx* saved = cur_;
         cur_ = &ctx;
 
         const Node* body = nullptr;
+        struct PrologueParam { const Node* node; std::u16string slot; int rest_index; };
+        std::vector<PrologueParam> prologue_params;
         if (ctorFnNode) {
             size_t nparams = ctorFnNode->children.empty() ? 0 : ctorFnNode->children.size() - 1;
-            for (size_t i = 0; i < nparams; ++i)
-                fn->param_names.push_back(u16(ctorFnNode->children[i]->str));
-            fn->arity = static_cast<uint32_t>(nparams);
+            uint32_t simple_leading = 0;
+            bool seen_complex = false;
+            for (size_t i = 0; i < nparams; ++i) {
+                const Node* p = ctorFnNode->children[i].get();
+                if (p->kind == NodeKind::Spread) {
+                    prologue_params.push_back({
+                        p->children.empty() ? p : p->children[0].get(),
+                        u"", static_cast<int>(fn->param_names.size())});
+                    seen_complex = true;
+                } else if (p->kind == NodeKind::Identifier && p->children.empty()) {
+                    fn->param_names.push_back(u16(p->str));
+                    if (!seen_complex) ++simple_leading;
+                } else {
+                    std::u16string slot = u16("%arg" + std::to_string(i) + "%");
+                    fn->param_names.push_back(slot);
+                    prologue_params.push_back({p, slot, -1});
+                    seen_complex = true;
+                }
+            }
+            fn->arity = simple_leading;
             body = ctorFnNode->children.empty() ? nullptr : ctorFnNode->children.back().get();
         }
+
+        auto emit_param_prologue = [&]() {
+            for (const auto& pp : prologue_params) {
+                int m = cur_->reg_top;
+                uint8_t value = alloc();
+                if (pp.rest_index >= 0) {
+                    uint8_t args = alloc();
+                    emit(OpCode::LoadVar, args, 0, 0,
+                         static_cast<int16_t>(str_const(u"arguments")));
+                    emit_array_slice(value, args, pp.rest_index);
+                } else {
+                    emit(OpCode::LoadVar, value, 0, 0,
+                         static_cast<int16_t>(str_const(pp.slot)));
+                }
+                bind_pattern_or_target(
+                    *pp.node, value, /*declare*/true, /*is_var*/false);
+                free_to(m);
+            }
+        };
 
         auto emit_fields = [&]() {
             for (const Node* f : fields) {
@@ -1494,6 +1703,7 @@ private:
             }
         };
 
+        emit_param_prologue();
         if (!has_super) {
             emit_fields();
             if (body && body->kind == NodeKind::Block) {
@@ -1586,10 +1796,8 @@ private:
         int mark = cur_->reg_top;
         uint8_t old = alloc();
         compile_expr(target, old);
-        uint8_t one = alloc();
-        emit(OpCode::LoadConst, one, 0, 0, static_cast<int16_t>(num_const(vm::Value::make_int32(1))));
         uint8_t nv = alloc();
-        emit(inc ? OpCode::Add : OpCode::Sub, nv, old, one, 0);
+        emit(inc ? OpCode::Inc : OpCode::Dec, nv, old, 0, 0);
         store_to_target(target, nv);
         emit(OpCode::Move, dst, postfix ? old : nv, 0, 0);
         free_to(mark);
@@ -1671,17 +1879,107 @@ private:
                 bind_pattern_or_target(target, dst, /*declare*/false, /*is_var*/false);
                 return;
             }
+            if (target.kind == NodeKind::Member) {
+                // ECMAScript evaluates the complete left-hand reference
+                // (base object, then computed key) before the right-hand side.
+                // Preserve that reference so side effects run once and cases
+                // such as `(x = {}).self = x` observe the new binding.
+                int mark = cur_->reg_top;
+                const bool super_member =
+                    is_super(*target.children[0]);
+                uint8_t object = alloc();
+                if (super_member)
+                    compile_member_base(target, object, false);
+                else
+                    compile_member_base(target, object, true);
+                uint8_t receiver = 0;
+                if (super_member) {
+                    receiver = alloc();
+                    emit(OpCode::LoadThis, receiver, 0, 0, 0);
+                }
+                bool computed = target.str == "[]";
+                uint8_t key = 0;
+                if (computed) {
+                    key = alloc();
+                    compile_expr(*target.children[1], key);
+                }
+                compile_expr(*n.children[1], dst);
+                std::u16string name = static_property_name(target);
+                if (!name.empty() && is_anon_fn(*n.children[1]))
+                    emit(OpCode::SetFnName, dst, 0, 0,
+                         static_cast<int16_t>(str_const(name)));
+                if (super_member && computed)
+                    emit(OpCode::SetSuperElem, object, receiver, key,
+                         static_cast<int16_t>(dst));
+                else if (super_member)
+                    emit(OpCode::SetSuperProp, object, dst, receiver,
+                         static_cast<int16_t>(
+                             str_const(u16(target.str))));
+                else if (computed)
+                    emit(OpCode::SetElem, object, key, dst, 0);
+                else
+                    emit(OpCode::SetProp, object, dst, 0,
+                         static_cast<int16_t>(
+                             str_const(u16(target.str))));
+                free_to(mark);
+                return;
+            }
             if (target.kind == NodeKind::Identifier)
                 compile_init_named(*n.children[1], dst, u16(target.str));  // named evaluation
-            else
+            else {
                 compile_expr(*n.children[1], dst);
+                std::u16string name = static_property_name(target);
+                if (!name.empty() && is_anon_fn(*n.children[1]))
+                    emit(OpCode::SetFnName, dst, 0, 0,
+                         static_cast<int16_t>(str_const(name)));
+            }
             store_to_target(target, dst);
             return;
         }
         // Logical assignment (short-circuit): a &&= b / a ||= b / a ??= b only
         // evaluate and store b when the gate passes.
         if (op == "&&=" || op == "||=" || op == "?\?=") {
-            compile_expr(target, dst);
+            int member_mark = cur_->reg_top;
+            uint8_t member_object = 0;
+            uint8_t member_key = 0;
+            const bool member = target.kind == NodeKind::Member;
+            const bool computed = member && target.str == "[]";
+            const bool super_member =
+                member && is_super(*target.children[0]);
+            uint8_t member_read_object = 0;
+            if (member) {
+                member_object = alloc();
+                compile_member_base(target, member_object, true);
+                member_read_object = member_object;
+                if (is_super(*target.children[0])) {
+                    member_read_object = alloc();
+                    compile_member_base(
+                        target, member_read_object, false);
+                }
+                if (computed) {
+                    member_key = alloc();
+                    compile_expr(*target.children[1], member_key);
+                    if (super_member)
+                        emit(OpCode::GetSuperElem, dst,
+                             member_read_object, member_object,
+                             static_cast<int16_t>(member_key));
+                    else
+                        emit(OpCode::GetElem, dst, member_read_object,
+                             member_key, 0);
+                } else {
+                    if (super_member)
+                        emit(OpCode::GetSuperProp, dst,
+                             member_read_object, member_object,
+                             static_cast<int16_t>(
+                                 str_const(u16(target.str))));
+                    else
+                        emit(OpCode::GetProp, dst, member_read_object, 0,
+                             static_cast<int16_t>(
+                                 str_const(u16(target.str))));
+                }
+            } else {
+                compile_expr(target, dst);
+            }
             int jskip;
             if (op == "&&=") {
                 jskip = emit(OpCode::JumpIfFalse, 0, dst, 0, 0);
@@ -1695,14 +1993,71 @@ private:
                 free_to(mark);
             }
             compile_expr(*n.children[1], dst);
-            store_to_target(target, dst);
+            if (member) {
+                if (super_member && computed)
+                    emit(OpCode::SetSuperElem, member_read_object,
+                         member_object, member_key,
+                         static_cast<int16_t>(dst));
+                else if (super_member)
+                    emit(OpCode::SetSuperProp, member_read_object, dst,
+                         member_object,
+                         static_cast<int16_t>(
+                             str_const(u16(target.str))));
+                else if (computed)
+                    emit(OpCode::SetElem, member_object, member_key, dst, 0);
+                else
+                    emit(OpCode::SetProp, member_object, dst, 0,
+                         static_cast<int16_t>(
+                             str_const(u16(target.str))));
+            } else {
+                store_to_target(target, dst);
+            }
             patch_imm(jskip, here());
+            free_to(member_mark);
             return;
         }
         // compound: target op= value  =>  target = target <op> value
         int mark = cur_->reg_top;
+        uint8_t member_object = 0;
+        uint8_t member_key = 0;
+        const bool member = target.kind == NodeKind::Member;
+        const bool computed = member && target.str == "[]";
+        const bool super_member =
+            member && is_super(*target.children[0]);
+        uint8_t member_read_object = 0;
+        if (member) {
+            member_object = alloc();
+            compile_member_base(target, member_object, true);
+            member_read_object = member_object;
+            if (is_super(*target.children[0])) {
+                member_read_object = alloc();
+                compile_member_base(target, member_read_object, false);
+            }
+            if (computed) {
+                member_key = alloc();
+                compile_expr(*target.children[1], member_key);
+            }
+        }
         uint8_t cur_v = alloc();
-        compile_expr(target, cur_v);
+        if (member) {
+            if (super_member && computed)
+                emit(OpCode::GetSuperElem, cur_v, member_read_object,
+                     member_object,
+                     static_cast<int16_t>(member_key));
+            else if (super_member)
+                emit(OpCode::GetSuperProp, cur_v, member_read_object,
+                     member_object,
+                     static_cast<int16_t>(
+                         str_const(u16(target.str))));
+            else if (computed)
+                emit(OpCode::GetElem, cur_v, member_read_object,
+                     member_key, 0);
+            else
+                emit(OpCode::GetProp, cur_v, member_read_object, 0,
+                     static_cast<int16_t>(str_const(u16(target.str))));
+        } else {
+            compile_expr(target, cur_v);
+        }
         uint8_t rhs = alloc();
         compile_expr(*n.children[1], rhs);
         OpCode oc = OpCode::Add;
@@ -1715,7 +2070,24 @@ private:
         else if (bop == ">>") oc = OpCode::Shr; else if (bop == ">>>") oc = OpCode::UShr;
         else throw CompileError{"unsupported assignment operator '" + op + "'"};
         emit(oc, dst, cur_v, rhs, 0);
-        store_to_target(target, dst);
+        if (member) {
+            if (super_member && computed)
+                emit(OpCode::SetSuperElem, member_read_object,
+                     member_object, member_key,
+                     static_cast<int16_t>(dst));
+            else if (super_member)
+                emit(OpCode::SetSuperProp, member_read_object, dst,
+                     member_object,
+                     static_cast<int16_t>(
+                         str_const(u16(target.str))));
+            else if (computed)
+                emit(OpCode::SetElem, member_object, member_key, dst, 0);
+            else
+                emit(OpCode::SetProp, member_object, dst, 0,
+                     static_cast<int16_t>(str_const(u16(target.str))));
+        } else {
+            store_to_target(target, dst);
+        }
         free_to(mark);
     }
 
@@ -1724,18 +2096,43 @@ private:
             emit(OpCode::StoreVar, 0, value_reg, 0, static_cast<int16_t>(str_const(u16(target.str))));
         } else if (target.kind == NodeKind::Member) {
             int mark = cur_->reg_top;
+            const bool super_member =
+                is_super(*target.children[0]);
             uint8_t robj = alloc();
-            compile_expr(*target.children[0], robj);
+            if (super_member)
+                compile_member_base(target, robj, false);
+            else
+                compile_member_base(target, robj, true);
+            uint8_t receiver = 0;
+            if (super_member) {
+                receiver = alloc();
+                emit(OpCode::LoadThis, receiver, 0, 0, 0);
+            }
             if (target.str == "[]") {
                 uint8_t rkey = alloc();
                 compile_expr(*target.children[1], rkey);
-                emit(OpCode::SetElem, robj, rkey, value_reg, 0);
+                if (super_member)
+                    emit(OpCode::SetSuperElem, robj, receiver, rkey,
+                         static_cast<int16_t>(value_reg));
+                else
+                    emit(OpCode::SetElem, robj, rkey, value_reg, 0);
             } else {
-                emit(OpCode::SetProp, robj, value_reg, 0, static_cast<int16_t>(str_const(u16(target.str))));
+                if (super_member)
+                    emit(OpCode::SetSuperProp, robj, value_reg,
+                         receiver,
+                         static_cast<int16_t>(
+                             str_const(u16(target.str))));
+                else
+                    emit(OpCode::SetProp, robj, value_reg, 0,
+                         static_cast<int16_t>(
+                             str_const(u16(target.str))));
             }
             free_to(mark);
         } else {
-            throw CompileError{"invalid assignment target"};
+            throw CompileError{
+                "invalid assignment target at " +
+                std::to_string(target.line) + ":" +
+                std::to_string(target.column)};
         }
     }
 

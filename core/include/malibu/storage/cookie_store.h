@@ -31,6 +31,11 @@ public:
     // Stores a cookie for `url` (domain/path default to the URL's host/path).
     void set_cookie(const std::string& url, Cookie cookie);
 
+    // Applies a document.cookie assignment. Returns false when the assignment
+    // is malformed or violates the current document's domain/secure boundary.
+    bool set_cookie_from_document(const std::string& url,
+                                  const std::string& assignment);
+
     // Cookies applicable to `url` under `ctx` (filters Secure/SameSite/HttpOnly).
     [[nodiscard]] std::vector<Cookie> get_cookies(const std::string& url, const Context& ctx) const;
 

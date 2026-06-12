@@ -30,6 +30,7 @@ enum class TokenType : uint8_t {
     Identifier,
     Keyword,
     NumberLiteral,
+    BigIntLiteral,
     StringLiteral,
     TemplateLiteral,
     RegexLiteral,
@@ -60,9 +61,9 @@ enum class NodeKind : uint8_t {
     ImportDeclaration, ExportDeclaration,
     // expressions
     Identifier,
-    NumberLiteral, StringLiteral, BoolLiteral, NullLiteral, UndefinedLiteral,
+    NumberLiteral, BigIntLiteral, StringLiteral, BoolLiteral, NullLiteral, UndefinedLiteral,
     TemplateLiteral, TaggedTemplate,
-    ArrayLiteral, ObjectLiteral,
+    ArrayLiteral, ArrayHole, ObjectLiteral,
     Member, Call, New, OptionalChain,
     Unary, Binary, Logical, Assignment, Conditional, Sequence,
     Await, Yield,
@@ -79,6 +80,7 @@ constexpr uint8_t ClassField    = 1u << 3;  // field (vs method)
 constexpr uint8_t Computed      = 1u << 4;  // `[expr]` computed key
 constexpr uint8_t Generator     = 1u << 5;  // `function*` / `*method` generator
 constexpr uint8_t Optional      = 1u << 6;  // optional chaining link (`?.` / `?.(` / `?.[`)
+constexpr uint8_t Grouped       = 1u << 7;  // expression was enclosed in parentheses
 }  // namespace node_flags
 
 struct Node {

@@ -101,6 +101,33 @@ TEST(Render, ZOrderCompositing) {
     EXPECT_EQ(fb.at(5, 5), (Color{0, 0, 255, 255}));
 }
 
+TEST(Render, DescendantCannotEscapeAncestorStackingContext) {
+    Scene s;
+    NodeHandle body = s.tree.create_element(u"body");
+    s.tree.append_child(s.doc.root(), body);
+    NodeHandle low = s.tree.create_element(u"div");
+    NodeHandle high_child = s.tree.create_element(u"div");
+    NodeHandle high = s.tree.create_element(u"div");
+    s.tree.set_attribute(low, u"id", u"low");
+    s.tree.set_attribute(high_child, u"id", u"high-child");
+    s.tree.set_attribute(high, u"id", u"high");
+    s.tree.append_child(body, low);
+    s.tree.append_child(low, high_child);
+    s.tree.append_child(body, high);
+    s.style(
+        u"body{margin:0}"
+        u"#low,#high,#high-child{position:absolute;top:0;left:0;width:40px;height:40px}"
+        u"#low{z-index:1;background:red}"
+        u"#high-child{z-index:999;background:green}"
+        u"#high{z-index:2;background:blue}");
+
+    LayoutBox* root = s.run(60, 60);
+    Renderer r;
+    Framebuffer fb =
+        r.render(s.doc, root, 60, 60, {255, 255, 255, 255});
+    EXPECT_EQ(fb.at(10, 10), (Color{0, 0, 255, 255}));
+}
+
 TEST(GlyphCache, ShelfPackingAllocates) {
     GlyphCache cache(64, 64);
     AtlasRect r1 = cache.get_or_insert({0, 'A'}, 10, 12, 1);

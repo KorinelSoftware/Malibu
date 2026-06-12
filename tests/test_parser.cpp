@@ -52,6 +52,24 @@ TEST(Parser, ParsesTaggedTemplates) {
     ASSERT_NE(r.program, nullptr);
 }
 
+TEST(Parser, DistinguishesDynamicImportFromImportDeclarations) {
+    Parser parser;
+    auto dynamic = parser.parse(
+        "import('./feature.js').then(run);", "dynamic-import.js");
+    ASSERT_TRUE(dynamic.program);
+    EXPECT_TRUE(dynamic.errors.empty());
+
+    auto declaration = parser.parse(
+        "import value from './feature.js';", "static-import.js");
+    ASSERT_TRUE(declaration.program);
+    EXPECT_TRUE(declaration.errors.empty());
+
+    auto meta = parser.parse(
+        "const moduleURL = import.meta.url;", "import-meta.js");
+    ASSERT_TRUE(meta.program);
+    EXPECT_TRUE(meta.errors.empty());
+}
+
 TEST(Parser, PreservesEmptyDoWhileBody) {
     Parser p;
     auto r = p.parse("let i = 0; do; while (i++ < 2);", "empty-do-while.js");
@@ -62,6 +80,16 @@ TEST(Parser, PreservesEmptyDoWhileBody) {
     ASSERT_EQ(loop.kind, NodeKind::DoWhile);
     ASSERT_EQ(loop.children.size(), 2u);
     EXPECT_EQ(loop.children[0]->kind, NodeKind::Block);
+}
+
+TEST(Parser, AppliesAutomaticSemicolonInsertionAfterReturnNewline) {
+    Parser parser;
+    auto result = parser.parse(
+        "function cleanup(){if(true)return\n"
+        "for(const key of keys){use(key)}}",
+        "return-asi.js");
+    ASSERT_TRUE(result.program);
+    EXPECT_TRUE(result.errors.empty());
 }
 
 TEST(Parser, PreservesSequenceExpressions) {
@@ -82,6 +110,32 @@ TEST(Parser, WrapsContinuousOptionalChains) {
     auto r = p.parse("const value = source?.app.getBuildNumber();", "optional-chain.js");
     ASSERT_TRUE(r.ok());
     ASSERT_NE(r.program, nullptr);
+}
+
+TEST(Parser, PreservesBigIntLiterals) {
+    Parser p;
+    auto r = p.parse(
+        "const decimal = 123456789012345678901234567890n;"
+        "const binary = 0b1010n;"
+        "const separated = 1_000_000n;",
+        "bigint.js");
+    ASSERT_TRUE(r.ok());
+    ASSERT_NE(r.program, nullptr);
+    ASSERT_EQ(r.program->children.size(), 3u);
+    ASSERT_FALSE(r.program->children[0]->children.empty());
+    ASSERT_FALSE(r.program->children[0]->children[0]->children.empty());
+    EXPECT_EQ(r.program->children[0]->children[0]->children[0]->kind,
+              NodeKind::BigIntLiteral);
+    EXPECT_EQ(r.program->children[1]->children[0]->children[0]->kind,
+              NodeKind::BigIntLiteral);
+}
+
+TEST(Parser, RejectsFractionalBigIntLiteral) {
+    Parser p;
+    auto r = p.parse("1.5n;", "bad-bigint.js");
+    EXPECT_FALSE(r.ok());
+    ASSERT_FALSE(r.errors.empty());
+    EXPECT_NE(r.errors[0].message.find("BigInt"), std::string::npos);
 }
 
 TEST(Parser, ReportsSyntaxErrorWithLocationAndNoProgram) {

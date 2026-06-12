@@ -22,11 +22,18 @@ struct Function {
     bool                                    is_arrow = false;
     bool                                    is_async = false;
     bool                                    is_generator = false;
+    // Named function expressions have a private lexical binding for recursive
+    // references. Method display names and inferred names do not.
+    bool                                    has_name_binding = false;
+    std::string                             source_name;
+    uint32_t                                source_line = 0;
+    uint32_t                                source_column = 0;
 
     uint32_t                                num_registers = 0;
     std::vector<uint64_t>                   code;            // encoded instructions
     std::vector<vm::Value>                  num_consts;      // numeric/bool constants
     std::vector<std::u16string>             str_consts;      // strings, var/property names
+    std::vector<std::string>                bigint_consts;   // source spelling, without trailing n
     std::vector<std::shared_ptr<Function>>  functions;       // nested function templates
 };
 

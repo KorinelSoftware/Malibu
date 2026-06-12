@@ -36,6 +36,20 @@ TEST(CSSParser, DiscardsMalformedDeclarationKeepsRest) {
     EXPECT_EQ(s.rules[0].declarations[1].property, std::u16string(u"width"));
 }
 
+TEST(CSSSupports, ReportsImplementedPropertiesAndSelectors) {
+    EXPECT_TRUE(supports_property_value(u"display", u"grid"));
+    EXPECT_TRUE(supports_property_value(u"width", u"calc(100% - 10px)"));
+    EXPECT_TRUE(supports_property_value(u"--theme-color", u"#ff00aa"));
+    EXPECT_FALSE(supports_property_value(u"display", u"ruby-text"));
+    EXPECT_FALSE(supports_property_value(u"backdrop-filter", u"blur(2px)"));
+    EXPECT_FALSE(supports_property_value(u"width", u"10px; color:red"));
+
+    EXPECT_TRUE(supports_selector(u".message:is(.new, .read)"));
+    EXPECT_TRUE(supports_condition(u"(display: flex) and (position: sticky)"));
+    EXPECT_FALSE(supports_condition(u"selector(::-webkit-scrollbar)"));
+    EXPECT_FALSE(supports_condition(u"selector(button:has(svg))"));
+}
+
 TEST(CSSSelector, Specificity) {
     EXPECT_TRUE((parse_selector(u"div").specificity) < (parse_selector(u".cls").specificity));
     EXPECT_TRUE((parse_selector(u".cls").specificity) < (parse_selector(u"#id").specificity));
@@ -157,6 +171,108 @@ TEST(CSSStyle, VarFallback) {
     r.add_stylesheet(parser.parse(u"p { color: var(--missing, blue); }"), Origin::Author);
     r.resolve(t.doc);
     EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{0, 0, 255, 255}));
+}
+
+TEST(CSSStyle, VarForwardReferencesAreOrderIndependent) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u":root { --foreground: var(--palette-entry); --palette-entry: #123456; }"
+        u"p { color: var(--foreground); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{0x12, 0x34, 0x56, 255}));
+}
+
+TEST(CSSStyle, VarCycleUsesFallbackAtPointOfUse) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u":root { --a: var(--b); --b: var(--a); }"
+        u"p { color: var(--a, rgb(12, 34, 56)); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{12, 34, 56, 255}));
+}
+
+TEST(CSSStyle, VarFallbackPreservesNestedCommas) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u"p { color: var(--missing, rgb(17, 34, 51)); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{17, 34, 51, 255}));
+}
+
+TEST(CSSStyle, ParsesModernHslWithCalcAndAlpha) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u":root { --saturation-factor: 1; --tone-hsl: 235 "
+        u"calc(var(--saturation-factor, 1)*86%) 65%; }"
+        u"p { color: hsl(var(--tone-hsl)/0.5); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{89, 102, 243, 128}));
+}
+
+TEST(CSSStyle, ParsesModernRgbPercentagesAndSlashAlpha) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u"p { color: rgb(100% 20% 0% / 25%); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{255, 51, 0, 64}));
+}
+
+TEST(CSSStyle, ParsesColorMixWithWeightedAlpha) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u"p { color: color-mix(in srgb, rgb(255 0 0 / 50%) 50%, blue 50%); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{85, 0, 170, 192}));
+}
+
+TEST(CSSStyle, ColorMixOklabHonorsZeroWeight) {
+    Tree t;
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u"p { color: color-mix(in oklab, hsl(0 0% 0% / 12%) 100%, "
+        u"hsl(0 0% 0% / 12%) 0%); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->color, (Color{0, 0, 0, 31}));
+}
+
+TEST(CSSStyle, ResolvesDiscordStyleColorMixChain) {
+    Tree t;
+    t.tree.set_attribute(t.div, u"class", u"theme-darker");
+    CSSParser parser;
+    StyleResolver r;
+    r.add_stylesheet(parser.parse(
+        u":root { --saturation-factor: 1; "
+        u"--opacity-black-12-hsl: 0 calc(var(--saturation-factor, 1)*0%) 0%; }"
+        u".theme-darker { --input-background-default:"
+        u"color-mix(in oklab,"
+        u"hsl(var(--opacity-black-12-hsl)/0.1215686275490196) 100%,"
+        u"hsl(var(--custom-theme-base-color-hsl,0 0% 0%)/0.1215686275490196) "
+        u"var(--custom-theme-base-color-amount,0%)); }"
+        u".theme-darker p { background-color:var(--input-background-default); }"),
+        Origin::Author);
+    r.resolve(t.doc);
+    EXPECT_EQ(r.style_for(t.doc, t.p)->background_color,
+              (Color{0, 0, 0, 31}));
 }
 
 TEST(CSSStyle, DisplayNone) {

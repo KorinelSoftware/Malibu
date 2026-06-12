@@ -49,7 +49,8 @@ public:
 
     // Runs a top-level compiled function (the program). Returns its completion
     // value. Throws ThrowSignal on an uncaught JS exception.
-    Value run_program(const compiler::Function* program);
+    Value run_program(const compiler::Function* program,
+                      bool isolated_top_level = false);
 
     // Calls a callable JS value. Throws ThrowSignal on an uncaught exception.
     Value call(Value callee, Value this_val, std::vector<Value>& args);
@@ -59,6 +60,9 @@ public:
 
     // ---- allocation helpers (used by builtins) ----
     JSString*   new_string(std::u16string s);
+    JSBigInt*   new_bigint(mpz_class value);
+    JSSymbol*   new_symbol(std::u16string description,
+                           std::u16string property_key = {});
     JSObject*   new_object();
     JSArray*    new_array();
     JSArrayBuffer* new_array_buffer(std::vector<uint8_t> data = {});
@@ -70,7 +74,11 @@ public:
 
     // ---- conversions / semantics (used by builtins) ----
     std::u16string to_string(Value v);
+    std::u16string to_property_key(Value v);
+    std::u16string symbol_descriptive_string(Value v);
     double         to_number(Value v);
+    Value          to_bigint(Value v);
+    Value          to_bigint_constructor(Value v);
     bool           to_bool(Value v);
     int32_t        to_int32(Value v);
     std::u16string js_typeof(Value v);
@@ -96,6 +104,9 @@ public:
 
     void set_console_sink(ConsoleSink* sink) { console_ = sink; }
     ConsoleSink* console_sink() const { return console_; }
+    void trace_call_stack_for_diagnostics(const char* reason) const {
+        trace_call_stack(reason);
+    }
 
     // DOM integration (optional). The binding layer installs hooks that route
     // property access on DOM node values through the WebCall ABI. With no hooks
@@ -110,6 +121,10 @@ public:
     JSObject* object_proto() { return object_proto_; }
     JSObject* array_proto()  { return array_proto_; }
     JSObject* string_proto() { return string_proto_; }
+    JSObject* bigint_proto() { return bigint_proto_; }
+    JSObject* number_proto() { return number_proto_; }
+    JSObject* boolean_proto() { return boolean_proto_; }
+    JSObject* symbol_proto() { return symbol_proto_; }
 
     // Public helpers used by builtins.
     void           set_prop_public(Value obj, const std::u16string& name, Value v) { set_prop(obj, name, v); }
@@ -171,6 +186,7 @@ private:
         std::vector<Handler>      handlers;
         bool                      pending_exc = false;
         Value                     exc_value;
+        bool                      pending_return = false;
         bool                      returning = false;
         Value                     return_value;
 
@@ -195,6 +211,8 @@ private:
 
     Value run_frame(Frame& frame);
     bool  unwind_to_handler(Frame& frame, Value exc);
+    bool  unwind_return_to_finally(Frame& frame);
+    void  trace_call_stack(const char* reason) const;
 
     // async machinery
     Value call_async(JSFunction* fn, Value this_val, std::vector<Value>& args);
@@ -211,6 +229,10 @@ private:
     // property / element access
     Value get_prop(Value obj, const std::u16string& name);
     void  set_prop(Value obj, const std::u16string& name, Value v, bool enumerable = true);
+    Value get_super_prop(Value base, const std::u16string& name,
+                         Value receiver);
+    void  set_super_prop(Value base, const std::u16string& name,
+                         Value v, Value receiver);
     Value object_get(JSObject* obj, const std::u16string& name, Value receiver);  // accessor-aware
     void  object_set(JSObject* obj, const std::u16string& name, Value v, Value receiver, bool enumerable = true);
     Value get_elem(Value obj, Value key);
@@ -227,6 +249,7 @@ private:
     bool  dom_set_prop(Value node, const std::u16string& name, Value v);
 
     void  install_builtins();
+    void  install_intl();
     void  install_array_proto();
     void  install_string_proto();
     void  install_typed_arrays();   // ArrayBuffer / TypedArrays / DataView (typed_arrays.cpp)
@@ -236,7 +259,9 @@ private:
     void  ta_set_index(JSTypedArray* ta, size_t idx, Value v);
     void  mark_roots(const heap::Heap::MarkFn& mark);
 
+    Value          to_primitive(Value v, bool prefer_string = false);
     std::u16string number_to_string(double d);
+    [[nodiscard]] bool is_bigint(Value v) const;
 
     heap::Heap&          heap_;
     Environment*         global_ = nullptr;
@@ -248,6 +273,7 @@ private:
     JSObject*            map_proto_ = nullptr;
     JSObject*            set_proto_ = nullptr;
     JSObject*            number_proto_ = nullptr;
+    JSObject*            bigint_proto_ = nullptr;
     JSObject*            boolean_proto_ = nullptr;
     JSObject*            symbol_proto_ = nullptr;
     JSObject*            array_buffer_proto_ = nullptr;
@@ -258,14 +284,21 @@ private:
     std::vector<Frame*>  frame_stack_;
     std::vector<std::shared_ptr<Frame>> suspended_frames_;  // rooted while awaiting
     std::deque<Microtask> microtasks_;
+    bool                 draining_microtasks_ = false;
     std::vector<Value>   temp_roots_;   // native scratch values kept alive across allocs
     std::unordered_map<uint64_t, vm::DomNodeRef*> dom_wrappers_;  // stable node-wrapper cache
+    std::unordered_map<std::u16string, JSSymbol*> symbol_registry_;
+    uint64_t             next_symbol_id_ = 0;
     std::vector<Value>   host_roots_;   // pending timer / rAF callbacks
     ConsoleSink*         console_ = nullptr;
     DomGetFn             dom_get_hook_;
     DomSetFn             dom_set_hook_;
     malibu::event_loop::EventLoop* loop_ = nullptr;
     int                  call_depth_ = 0;
+    std::vector<std::u16string> call_names_;
+    std::vector<JSFunction*> call_functions_;
+    std::vector<Value> call_receivers_;
+    std::vector<std::vector<Value>> call_arguments_;
 
     friend struct Builtins;
 };

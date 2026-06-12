@@ -104,7 +104,7 @@ void Interpreter::install_typed_arrays() {
             if (std::isnan(len) || len < 0) in.throw_error(u"RangeError", u"Invalid ArrayBuffer length");
             return Value::make_heap_ptr(new_buffer(static_cast<size_t>(len)));
         }, 1);
-        AB->set(u"prototype", Value::make_heap_ptr(array_buffer_proto_));
+        AB->set(u"prototype", Value::make_heap_ptr(array_buffer_proto_), false);
         array_buffer_proto_->set(u"constructor", Value::make_heap_ptr(AB), false);
         AB->set(u"isView", Value::make_heap_ptr(new_native(u"isView", [](Interpreter&, Value, std::vector<Value>& a) {
             Value v = arg(a, 0);
@@ -350,7 +350,7 @@ void Interpreter::install_typed_arrays() {
             return Value::make_heap_ptr(mk(new_buffer(n * es), 0, n));
         }, 3);
 
-        ctor->set(u"prototype", Value::make_heap_ptr(proto));
+        ctor->set(u"prototype", Value::make_heap_ptr(proto), false);
         ctor->set(u"BYTES_PER_ELEMENT", Value::make_int32(static_cast<int32_t>(es)));
         proto->set(u"constructor", Value::make_heap_ptr(ctor), false);
         proto->set(u"BYTES_PER_ELEMENT", Value::make_int32(static_cast<int32_t>(es)), false);
@@ -388,7 +388,7 @@ void Interpreter::install_typed_arrays() {
             dv->proto = self->data_view_proto_; dv->buffer = buf; dv->byte_offset = off; dv->byte_length = len;
             return Value::make_heap_ptr(dv);
         }, 1);
-        DV->set(u"prototype", Value::make_heap_ptr(data_view_proto_));
+        DV->set(u"prototype", Value::make_heap_ptr(data_view_proto_), false);
         data_view_proto_->set(u"constructor", Value::make_heap_ptr(DV), false);
 
         auto dv_of = [](Interpreter& in, Value t) -> JSDataView* {

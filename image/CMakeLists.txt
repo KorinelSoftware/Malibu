@@ -9,6 +9,7 @@ add_library(malibu_image OBJECT
     jpeg.cpp
     webp.cpp
     svg.cpp
+    gif.cpp
 )
 target_include_directories(malibu_image PUBLIC
     "${CMAKE_SOURCE_DIR}/core/include"
@@ -24,3 +25,5 @@ target_link_directories(malibu_image PUBLIC ${LIBPNG_LIBRARY_DIRS})
 target_include_directories(malibu_image SYSTEM PRIVATE /usr/include)  # jpeglib.h (headers only)
 # libjpeg's setjmp/longjmp error path trips GCC's -Wclobbered with C++ locals.
 set_source_files_properties(jpeg.cpp PROPERTIES COMPILE_OPTIONS "-Wno-clobbered")
+# gif.cpp has unused function warning for decode_gif (used via decode_image in jpeg.cpp)
+set_source_files_properties(gif.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-function")

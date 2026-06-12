@@ -16,7 +16,7 @@ namespace malibu::js::bytecode {
 // "MLBS" little-endian magic.
 inline constexpr uint32_t kBytecodeMagic   = 0x4D4C4253u;
 // Monotonic version — increment on ANY change to the instruction set / encoding.
-inline constexpr uint32_t kBytecodeVersion = 1u;
+inline constexpr uint32_t kBytecodeVersion = 4u;
 
 struct BytecodeHeader {
     uint32_t magic              = kBytecodeMagic;
@@ -38,6 +38,7 @@ enum class OpCode : uint8_t {
     Return, ReturnUndefined,
     NewObject, NewArray, NewClosure,
     GetProp, SetProp, GetElem, SetElem, DeleteProp,
+    GetSuperProp, SetSuperProp, GetSuperElem, SetSuperElem,
     TypeOf, InstanceOf, In,
     Throw, TryCatch, TryFinally, EndTry,
     Await, Yield, YieldStar,
@@ -51,7 +52,7 @@ enum class OpCode : uint8_t {
     LoadNull,        // dst <- null
     LoadBool,        // dst <- (imm != 0)
     LoadThis,        // dst <- this
-    DefineVar,       // env.define(str_consts[imm], reg[src_a])
+    DefineVar,       // dst: 0 current, 1 function, 2 function-if-absent
     LoadVar,         // dst <- env.lookup(str_consts[imm])
     StoreVar,        // env.assign(str_consts[imm], reg[src_a])
     PushScope,       // enter a child lexical scope
@@ -67,14 +68,17 @@ enum class OpCode : uint8_t {
     SetProto,        // internal [[Prototype]] of reg[dst] <- reg[src_a]
     CallV,           // dst <- callee(this, ...argsArray): src_a=calleeReg src_b=thisReg imm=argsArrayReg
     ConstructV,      // dst <- new callee(...argsArray): src_a=calleeReg imm=argsArrayReg
-    ArrayAppend,     // reg[dst] (array) <- push reg[src_a] (imm=0) or spread reg[src_a] (imm=1)
+    ArrayAppend,     // reg[dst] <- value (imm=0), spread (imm=1), or an elision/hole (imm=2)
     CopyProps,       // copy own enumerable props of reg[src_a] into reg[dst] (object spread)
-    DefineAccessor,  // reg[dst].define_accessor(str_consts[imm], reg[src_a], setter=src_b)
-    DefineAccessorV, // reg[dst].define_accessor(toKey(reg[src_b]), reg[src_a], setter=imm)
+    DefineAccessor,  // accessor; src_b bit 0=setter, bit 1=enumerable
+    DefineAccessorV, // computed accessor; imm bit 0=setter, bit 1=enumerable
     SetFnName,       // if reg[dst] is a function with an empty name, name <- str_consts[imm]
     DeleteElem,      // dst <- delete reg[src_a][reg[src_b]]
     PushWithScope,   // enter a `with` scope backed by the object in reg[src_a]
     LoadVarOrUndef,  // dst <- env.lookup(str_consts[imm]) or undefined (no throw) — for `typeof x`
+    LoadBigInt,      // dst <- JSBigInt(bigint_consts[imm])
+    Inc,             // dst <- ToNumeric(src_a) + same-type one
+    Dec,             // dst <- ToNumeric(src_a) - same-type one
 };
 
 // ---------------------------------------------------------------------------

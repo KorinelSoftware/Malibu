@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "malibu/dom/document.h"
@@ -108,6 +109,14 @@ public:
     // ---- request interception ----
     // Invoked before the network engine sends a request. Return true (and fill
     // `out`) to satisfy the request locally; false to let it proceed.
+    using FetchHandler = std::function<bool(
+        const network::FetchRequest& request,
+        network::FetchResponse& out)>;
+    void set_fetch_handler(FetchHandler handler) {
+        fetch_handler_ = std::move(handler);
+    }
+
+    // Compatibility adapter for the original URL-only embedding API.
     using RequestHandler = std::function<bool(const std::string& url, network::FetchResponse& out)>;
     void set_request_handler(RequestHandler handler) { request_handler_ = std::move(handler); }
 
@@ -141,7 +150,7 @@ public:
     [[nodiscard]] uint32_t sandbox() const noexcept { return sandbox_; }
 
     // ---- pump the event loop (timers, promises, rAF) ----
-    void run_tasks(uint64_t elapsed_ms = 0) { engine_.run_ready_tasks(elapsed_ms); }
+    void run_tasks(uint64_t elapsed_ms = 0);
 
     // ---- accessors (for tests / hosts) ----
     dom::Document&        document() { return *doc_; }
@@ -154,14 +163,24 @@ private:
     void reset_document();
     void apply_styles();
     void run_scripts(const std::vector<malibu::html::ScriptItem>& items);
+    void handle_dom_mutation(malibu::NodeHandle node);
+    void handle_form_submit(malibu::NodeHandle form);
+    void process_pending_navigation();
+    void prepare_connected_resource(malibu::NodeHandle node);
     void record_diagnostic(LoadDiagnosticKind kind, std::string url,
                            std::string message);
+    bool perform_request(const network::FetchRequest& request,
+                         network::FetchResponse& response);
+    bool perform_request(const std::string& url,
+                         network::FetchResponse& response);
+    bool load_script_source(const std::string& url, std::string& source);
     // Resolves a possibly-relative script/resource URL against the current page.
     std::string resolve_url(const std::u16string& ref) const;
     // Dispatches a window-level event (e.g. DOMContentLoaded / load) to listeners
     // registered via window.addEventListener.
     void fire_window_event(const std::u16string& type);
     void install_view_globals();
+    void install_worker_globals();
     void install_wasm_globals();   // the `WebAssembly` JS API over MalibuWASM
     // Builds (or returns) a rendering context for a <canvas> element. "2d" gives
     // a MalibuCanvas-backed CanvasRenderingContext2D; the bitmap is composited
@@ -171,10 +190,14 @@ private:
     void composite_canvases(render::Framebuffer& fb, float scroll_y = 0.0f);
     // Fetches + decodes <img> sources, sizing their boxes (inline style) so they
     // lay out, and registering bitmaps for compositing.
-    void load_images(const malibu::html::ParsedDocument& parsed);
+    void load_images(const malibu::html::ParsedDocument& parsed,
+                     bool reset_existing = true,
+                     bool materialize_controls = true);
 
     // Engine instance (persists across navigations within this view).
     js::Engine                           engine_;
+    struct WorkerState;
+    std::vector<std::shared_ptr<WorkerState>> workers_;
 
     // Per-document state (recreated on each navigation).
     std::unique_ptr<dom::Document>       doc_;
@@ -192,11 +215,15 @@ private:
     storage::StorageEngine               storage_;
     security::Origin                     origin_;
     std::vector<std::u16string>          pending_stylesheets_;
+    std::unordered_set<uint64_t>         prepared_resource_nodes_;
+    bool                                 replaced_content_dirty_ = true;
 
     // MalibuWASM: decoded modules / live instances, kept alive while JS holds
     // their wrapper objects (the wrappers store an index into these).
     std::vector<std::unique_ptr<malibu::wasm::Module>>   wasm_modules_;
     std::vector<std::unique_ptr<malibu::wasm::Instance>> wasm_instances_;
+    std::vector<js::runtime::Value>                      wasm_reference_values_;
+    std::vector<js::runtime::Value>                      wasm_host_roots_;
 
     // MalibuCanvas: per-<canvas> 2D surfaces, keyed by node handle, composited
     // into the framebuffer in render().
@@ -209,6 +236,8 @@ private:
     std::vector<std::string>             history_html_;
     size_t                               history_pos_ = 0;
     std::string                          current_url_ = "about:blank";
+    std::string                          pending_navigation_url_;
+    bool                                 processing_pending_navigation_ = false;
 
     // Dynamic interaction state (drives :hover/:focus/:active + input routing).
     malibu::NodeHandle                   hovered_ = malibu::NodeHandle::null_handle();
@@ -221,6 +250,7 @@ private:
     bool                                 layout_dirty_ = true;
 
     std::function<void(const std::string&)> message_handler_;
+    FetchHandler                            fetch_handler_;
     RequestHandler                          request_handler_;
     DiagnosticHandler                       diagnostic_handler_;
     std::vector<LoadDiagnostic>              diagnostics_;

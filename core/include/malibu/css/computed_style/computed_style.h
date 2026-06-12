@@ -84,6 +84,8 @@ enum class FlexDirection : uint8_t { Row, RowReverse, Column, ColumnReverse };
 enum class FlexWrap      : uint8_t { NoWrap, Wrap, WrapReverse };
 enum class AlignItems    : uint8_t { Stretch, FlexStart, FlexEnd, Center, Baseline };
 enum class JustifyContent: uint8_t { FlexStart, FlexEnd, Center, SpaceBetween, SpaceAround, SpaceEvenly };
+enum class AlignContent  : uint8_t { Normal, FlexStart, FlexEnd, Center, SpaceBetween, SpaceAround, SpaceEvenly, Stretch };
+enum class JustifyItems  : uint8_t { Stretch, FlexStart, FlexEnd, Center, Baseline };
 enum class TextAlign     : uint8_t { Left, Right, Center, Justify };
 enum class FontWeight    : uint16_t { Normal = 400, Bold = 700 };
 enum class FloatType     : uint8_t { None, Left, Right };
@@ -100,6 +102,7 @@ struct FlexProps {
     FlexWrap       wrap = FlexWrap::NoWrap;
     AlignItems     align_items = AlignItems::Stretch;
     JustifyContent justify_content = JustifyContent::FlexStart;
+    AlignContent   align_content = AlignContent::Normal;
     float          grow = 0.0f;
     float          shrink = 1.0f;
     Length         basis = Length::auto_();
@@ -134,7 +137,11 @@ struct ComputedStyle {
     float         border_radius_percent = 0.0f;
     float         aspect_ratio  = 0.0f;                 // width/height (0 = none) — replaced-element sizing
     std::u16string grid_template_columns;             // e.g. "1fr 2fr" / "repeat(3, 1fr)" / "200px auto"
+    std::u16string grid_template_rows;                // e.g. "1fr 2fr" / "repeat(3, 1fr)" / "200px auto"
     float          gap = 0.0f;                          // row/column gap (flex & grid)
+    float          row_gap = 0.0f;
+    float          column_gap = 0.0f;
+    JustifyItems   justify_items = JustifyItems::Stretch;
 
     // Visual
     Color          color            = {0, 0, 0, 255};

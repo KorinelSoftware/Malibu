@@ -44,4 +44,12 @@ public:
     StyleSheet parse(std::u16string_view source);
 };
 
+// CSS Conditional Rules capability queries used by the Web-exposed CSS
+// namespace. These report the syntax and values the current engine can
+// actually parse and apply.
+bool supports_property_value(std::u16string_view property,
+                             std::u16string_view value);
+bool supports_selector(std::u16string_view selector);
+bool supports_condition(std::u16string_view condition);
+
 } // namespace malibu::css

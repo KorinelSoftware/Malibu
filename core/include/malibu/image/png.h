@@ -31,7 +31,10 @@ DecodedImage decode_jpeg(const uint8_t* data, size_t len);
 // Decodes a WebP from memory to RGBA8 (libwebp via dlopen; ok=false if absent).
 DecodedImage decode_webp(const uint8_t* data, size_t len);
 
-// Auto-detects PNG/JPEG by magic and decodes.
+// Decodes a GIF from memory to RGBA8 (libgif via dlopen; ok=false if absent).
+DecodedImage decode_gif(const uint8_t* data, size_t len);
+
+// Auto-detects PNG/JPEG/GIF by magic and decodes.
 DecodedImage decode_image(const uint8_t* data, size_t len);
 
 // Rasterizes an SVG document to RGBA8 at the given pixel size (vector → needs a

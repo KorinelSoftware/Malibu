@@ -4,8 +4,13 @@
 
 #include "malibu/js/parser/parser.h"
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -47,6 +52,97 @@ void utf8_append(std::string& s, uint32_t cp) {
     else if (cp < 0x800) { s.push_back(static_cast<char>(0xC0 | (cp >> 6))); s.push_back(static_cast<char>(0x80 | (cp & 0x3F))); }
     else if (cp < 0x10000) { s.push_back(static_cast<char>(0xE0 | (cp >> 12))); s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F))); s.push_back(static_cast<char>(0x80 | (cp & 0x3F))); }
     else { s.push_back(static_cast<char>(0xF0 | (cp >> 18))); s.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F))); s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F))); s.push_back(static_cast<char>(0x80 | (cp & 0x3F))); }
+}
+
+std::string decimal_from_bigint_literal(std::string raw) {
+    raw.erase(std::remove(raw.begin(), raw.end(), '_'), raw.end());
+    unsigned base = 10;
+    size_t start = 0;
+    if (raw.size() > 2 && raw[0] == '0') {
+        const char prefix =
+            static_cast<char>(std::tolower(static_cast<unsigned char>(raw[1])));
+        if (prefix == 'x') base = 16;
+        else if (prefix == 'o') base = 8;
+        else if (prefix == 'b') base = 2;
+        if (base != 10) start = 2;
+    }
+
+    std::string decimal = "0";
+    for (size_t i = start; i < raw.size(); ++i) {
+        const unsigned digit = static_cast<unsigned>(hex_digit(raw[i]));
+        unsigned carry = digit;
+        for (size_t j = decimal.size(); j-- > 0;) {
+            const unsigned value =
+                static_cast<unsigned>(decimal[j] - '0') * base + carry;
+            decimal[j] = static_cast<char>('0' + value % 10);
+            carry = value / 10;
+        }
+        while (carry != 0) {
+            decimal.insert(decimal.begin(),
+                           static_cast<char>('0' + carry % 10));
+            carry /= 10;
+        }
+    }
+    const size_t nonzero = decimal.find_first_not_of('0');
+    return nonzero == std::string::npos ? "0" : decimal.substr(nonzero);
+}
+
+double number_from_literal(std::string raw) {
+    raw.erase(std::remove(raw.begin(), raw.end(), '_'), raw.end());
+    if (raw.size() > 2 && raw[0] == '0') {
+        const char prefix =
+            static_cast<char>(std::tolower(static_cast<unsigned char>(raw[1])));
+        int base = 0;
+        if (prefix == 'x') base = 16;
+        else if (prefix == 'o') base = 8;
+        else if (prefix == 'b') base = 2;
+        if (base != 0) {
+            unsigned long long value = 0;
+            for (size_t i = 2; i < raw.size(); ++i)
+                value = value * static_cast<unsigned>(base) +
+                        static_cast<unsigned>(hex_digit(raw[i]));
+            return static_cast<double>(value);
+        }
+    }
+    char* end = nullptr;
+    const double value = std::strtod(raw.c_str(), &end);
+    return end == raw.c_str() ? 0.0 : value;
+}
+
+std::string string_from_number(double value) {
+    if (value == 0.0) return "0";
+    if (!std::isfinite(value)) return value < 0 ? "-Infinity" : "Infinity";
+
+    char buffer[128];
+    const double magnitude = std::abs(value);
+    const std::chars_format format =
+        magnitude >= 1e-6 && magnitude < 1e21
+            ? std::chars_format::fixed
+            : std::chars_format::general;
+    auto result = std::to_chars(
+        std::begin(buffer), std::end(buffer), value, format);
+    if (result.ec != std::errc()) return "0";
+    std::string out(buffer, result.ptr);
+
+    const size_t exponent = out.find_first_of("eE");
+    if (exponent != std::string::npos) {
+        out[exponent] = 'e';
+        size_t digits = exponent + 1;
+        if (digits < out.size() &&
+            (out[digits] == '+' || out[digits] == '-'))
+            ++digits;
+        while (digits + 1 < out.size() && out[digits] == '0')
+            out.erase(digits, 1);
+    }
+    return out;
+}
+
+std::string static_property_key(const Token& token) {
+    if (token.type == TokenType::NumberLiteral)
+        return string_from_number(number_from_literal(token.value));
+    if (token.type == TokenType::BigIntLiteral)
+        return decimal_from_bigint_literal(token.value);
+    return token.value;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +224,7 @@ private:
         switch (last.type) {
             case TokenType::Identifier:
             case TokenType::NumberLiteral:
+            case TokenType::BigIntLiteral:
             case TokenType::StringLiteral:
             case TokenType::TemplateLiteral:
             case TokenType::RegexLiteral:
@@ -199,17 +296,26 @@ private:
 
     bool lex_number(Token& tok, ParseError& err) {
         std::string s;
-        if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X' ||
-                              peek(1) == 'b' || peek(1) == 'B' ||
-                              peek(1) == 'o' || peek(1) == 'O')) {
+        bool prefixed = peek() == '0' && (peek(1) == 'x' || peek(1) == 'X' ||
+                                          peek(1) == 'b' || peek(1) == 'B' ||
+                                          peek(1) == 'o' || peek(1) == 'O');
+        bool seen_dot = false;
+        bool seen_exp = false;
+        if (prefixed) {
             s.push_back(advance()); // 0
             s.push_back(advance()); // x/b/o
-            while (pos_ < src_.size() &&
-                   (std::isalnum(static_cast<unsigned char>(src_[pos_])) || src_[pos_] == '_')) {
+            char prefix = static_cast<char>(std::tolower(static_cast<unsigned char>(s[1])));
+            auto valid_digit = [prefix](char digit) {
+                if (digit == '_') return true;
+                if (prefix == 'b') return digit == '0' || digit == '1';
+                if (prefix == 'o') return digit >= '0' && digit <= '7';
+                return std::isdigit(static_cast<unsigned char>(digit)) ||
+                       (digit >= 'a' && digit <= 'f') || (digit >= 'A' && digit <= 'F');
+            };
+            while (pos_ < src_.size() && valid_digit(src_[pos_])) {
                 s.push_back(advance());
             }
         } else {
-            bool seen_dot = false, seen_exp = false;
             while (pos_ < src_.size()) {
                 char c = src_[pos_];
                 if (std::isdigit(static_cast<unsigned char>(c)) || c == '_') {
@@ -228,9 +334,16 @@ private:
             err = make_err(tok, "invalid numeric literal");
             return false;
         }
-        if (pos_ < src_.size() && src_[pos_] == 'n') advance();  // BigInt suffix (treated as Number)
+        bool bigint = pos_ < src_.size() && src_[pos_] == 'n';
+        if (bigint) {
+            if (!prefixed && (seen_dot || seen_exp)) {
+                err = make_err(tok, "BigInt literal cannot contain a decimal point or exponent");
+                return false;
+            }
+            advance();
+        }
         tok.value = s;
-        tok.type = TokenType::NumberLiteral;
+        tok.type = bigint ? TokenType::BigIntLiteral : TokenType::NumberLiteral;
         return true;
     }
 
@@ -456,11 +569,36 @@ private:
             accept_punct(";");
             return n;
         }
-        if (is_kw("import"))   return parse_passthrough_to_semi(NodeKind::ImportDeclaration);
+        if (is_kw("import") &&
+            !(peek().type == TokenType::Punctuator &&
+              peek().value == "("))
+            return parse_passthrough_to_semi(NodeKind::ImportDeclaration);
         if (is_kw("export")) {
             advance();
-            // `export` followed by a declaration: parse the declaration.
             auto n = mk(NodeKind::ExportDeclaration);
+            // Export lists and re-exports do not execute code in the module
+            // body. Consume them as syntax instead of parsing `as`/`from` as
+            // ordinary identifiers.
+            if (is_punct("{")) {
+                int depth = 0;
+                do {
+                    if (is_punct("{")) ++depth;
+                    else if (is_punct("}")) --depth;
+                    advance();
+                } while (!at_end() && depth > 0);
+                while (!at_end() && !is_punct(";")) advance();
+                accept_punct(";");
+                return n;
+            }
+            if (is_punct("*")) {
+                while (!at_end() && !is_punct(";")) advance();
+                accept_punct(";");
+                return n;
+            }
+            // Malibu currently has no observable module namespace, but the
+            // default declaration/expression still executes.
+            accept_kw("default");
+            // `export` followed by a declaration: parse the declaration.
             if (!is_punct(";") && !at_end()) {
                 auto inner = parse_statement();
                 if (failed_) return nullptr;
@@ -579,8 +717,9 @@ private:
                 key_expr = parse_assignment(); if (failed_) return nullptr;
                 if (!expect_punct("]")) return nullptr;
             } else if (cur().type == TokenType::StringLiteral || cur().type == TokenType::NumberLiteral ||
+                       cur().type == TokenType::BigIntLiteral ||
                        cur().type == TokenType::Identifier || cur().type == TokenType::Keyword) {
-                key = advance().value;
+                key = static_property_key(advance());
             } else { fail("expected property name in pattern"); return nullptr; }
 
             auto prop = mk(NodeKind::Member);
@@ -744,8 +883,9 @@ private:
             if (!expect_punct("]")) return nullptr;
             if (key) m->children.push_back(std::move(key));  // key expr trails the value
         } else if (cur().type == TokenType::StringLiteral || cur().type == TokenType::NumberLiteral ||
+                   cur().type == TokenType::BigIntLiteral ||
                    cur().type == TokenType::Identifier || cur().type == TokenType::Keyword) {
-            m->str = advance().value;
+            m->str = static_property_key(advance());
         } else {
             fail("expected class member name"); return nullptr;
         }
@@ -775,8 +915,12 @@ private:
 
     NodePtr parse_return() {
         auto n = mk(NodeKind::Return);
+        const uint32_t return_line = cur().line;
         advance();
-        if (!is_punct(";") && !is_punct("}") && !at_end()) {
+        // ReturnStatement is a restricted production: a line terminator after
+        // `return` inserts a semicolon before the following token.
+        if (cur().line == return_line && !is_punct(";") &&
+            !is_punct("}") && !at_end()) {
             auto e = parse_expression();
             if (failed_) return nullptr;
             if (e) n->children.push_back(std::move(e));
@@ -1271,6 +1415,7 @@ private:
         const Token& t = cur();
         switch (t.type) {
             case TokenType::NumberLiteral: { auto n = mk(NodeKind::NumberLiteral); n->str = advance().value; return n; }
+            case TokenType::BigIntLiteral: { auto n = mk(NodeKind::BigIntLiteral); n->str = advance().value; return n; }
             case TokenType::StringLiteral: { auto n = mk(NodeKind::StringLiteral); n->str = advance().value; return n; }
             case TokenType::TemplateLiteral: { std::string raw = advance().value; return build_template_expr(raw); }
             case TokenType::RegexLiteral: {
@@ -1292,6 +1437,30 @@ private:
                 if (t.value == "null") { auto n = mk(NodeKind::NullLiteral); advance(); return n; }
                 if (t.value == "undefined") { auto n = mk(NodeKind::UndefinedLiteral); advance(); return n; }
                 if (t.value == "this" || t.value == "super") { auto n = mk(NodeKind::Identifier); n->str = advance().value; return n; }
+                if (t.value == "import" &&
+                    peek().type == TokenType::Punctuator &&
+                    peek().value == "(") {
+                    advance();
+                    auto n = mk(NodeKind::Identifier);
+                    n->str = "__dynamicImport";
+                    return n;
+                }
+                if (t.value == "import" &&
+                    peek().type == TokenType::Punctuator &&
+                    peek().value == ".") {
+                    advance();
+                    advance();
+                    if (!(cur().type == TokenType::Identifier ||
+                          cur().type == TokenType::Keyword) ||
+                        cur().value != "meta") {
+                        fail("expected 'meta' after 'import.'");
+                        return nullptr;
+                    }
+                    advance();
+                    auto n = mk(NodeKind::Identifier);
+                    n->str = "__importMeta";
+                    return n;
+                }
                 if (t.value == "function") return parse_function_decl();
                 if (t.value == "async") {
                     advance();
@@ -1308,6 +1477,7 @@ private:
                     auto e = parse_expression();
                     if (failed_) return nullptr;
                     if (!expect_punct(")")) return nullptr;
+                    if (e) e->flags |= node_flags::Grouped;
                     return e;
                 }
                 if (t.value == "[") return parse_array_literal();
@@ -1324,7 +1494,10 @@ private:
         auto n = mk(NodeKind::ArrayLiteral);
         expect_punct("[");
         while (!is_punct("]") && !at_end()) {
-            if (accept_punct(",")) continue; // elision
+            if (accept_punct(",")) {
+                n->children.push_back(mk(NodeKind::ArrayHole));
+                continue;
+            }
             bool spread = accept_punct("...");
             auto e = parse_assignment(); if (failed_) return nullptr;
             if (spread) {
@@ -1364,7 +1537,7 @@ private:
                     next.type == TokenType::Identifier ||
                     next.type == TokenType::Keyword ||
                     next.type == TokenType::StringLiteral ||
-                    next.type == TokenType::NumberLiteral ||
+                    next.type == TokenType::NumberLiteral || next.type == TokenType::BigIntLiteral ||
                     (next.type == TokenType::Punctuator &&
                      (next.value == "[" || next.value == "*"));
                 if (same_line && followed_by_key) {
@@ -1380,6 +1553,7 @@ private:
                 const Token& nx = peek();
                 bool next_is_key = nx.type == TokenType::Identifier || nx.type == TokenType::Keyword ||
                                    nx.type == TokenType::StringLiteral || nx.type == TokenType::NumberLiteral ||
+                                   nx.type == TokenType::BigIntLiteral ||
                                    (nx.type == TokenType::Punctuator && nx.value == "[");
                 if (next_is_key) accessor_flag = (cur().value == "get") ? node_flags::ClassGetter : node_flags::ClassSetter;
                 if (accessor_flag) advance();
@@ -1391,8 +1565,9 @@ private:
                 key_expr = parse_assignment(); if (failed_) return nullptr;
                 expect_punct("]");
             } else if (cur().type == TokenType::StringLiteral || cur().type == TokenType::NumberLiteral ||
+                       cur().type == TokenType::BigIntLiteral ||
                        cur().type == TokenType::Identifier || cur().type == TokenType::Keyword) {
-                key = advance().value;
+                key = static_property_key(advance());
             } else { fail("expected property key"); return nullptr; }
 
             auto prop = std::make_unique<Node>(NodeKind::Member);

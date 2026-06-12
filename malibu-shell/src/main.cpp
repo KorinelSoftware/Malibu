@@ -135,10 +135,15 @@ int main(int argc, char** argv) {
 
     malibu::view::View view;
     malibu::host::CurlResourceLoader loader;
-    view.set_request_handler([&loader](
-        const std::string& url,
+    view.set_socket_handler(
+        [&loader](int id, const std::string& url,
+                  const std::string& data, int kind) {
+            loader.websocket_command(id, url, data, kind);
+        });
+    view.set_fetch_handler([&loader](
+        const malibu::network::FetchRequest& request,
         malibu::network::FetchResponse& out) -> bool {
-        return loader.fetch(url, out);
+        return loader.fetch(request, out);
     });
     view.set_diagnostic_handler([](
         const malibu::view::LoadDiagnostic& diagnostic) {
@@ -262,6 +267,24 @@ int main(int argc, char** argv) {
         // Pump work ready at the real browser clock without draining persistent
         // intervals forever.
         uint64_t now_tick = SDL_GetTicks64();
+        malibu::host::CurlResourceLoader::SocketEvent socket_event;
+        while (loader.poll_websocket_event(socket_event)) {
+            switch (socket_event.type) {
+                case malibu::host::CurlResourceLoader::SocketEventType::Open:
+                    view.socket_open(socket_event.id);
+                    break;
+                case malibu::host::CurlResourceLoader::SocketEventType::Message:
+                    view.socket_message(
+                        socket_event.id, socket_event.data);
+                    break;
+                case malibu::host::CurlResourceLoader::SocketEventType::Close:
+                    view.socket_close(
+                        socket_event.id, socket_event.code,
+                        socket_event.reason);
+                    break;
+            }
+            dirty = true;
+        }
         view.run_tasks(now_tick - last_tick);
         last_tick = now_tick;
 

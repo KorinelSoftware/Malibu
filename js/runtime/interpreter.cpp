@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 
 namespace malibu::js::runtime {
@@ -28,6 +30,61 @@ bool parse_index(const std::u16string& s, size_t& out) {
     out = v; return true;
 }
 constexpr int kMaxCallDepth = 2000;
+
+bool parse_bigint_text(std::string text, mpz_class& out, bool allow_separators) {
+    size_t first = text.find_first_not_of(" \t\n\r\f\v");
+    if (first == std::string::npos) {
+        out = 0;
+        return true;
+    }
+    size_t last = text.find_last_not_of(" \t\n\r\f\v");
+    text = text.substr(first, last - first + 1);
+
+    bool negative = false;
+    bool had_sign = false;
+    if (!text.empty() && (text[0] == '+' || text[0] == '-')) {
+        had_sign = true;
+        negative = text[0] == '-';
+        text.erase(text.begin());
+    }
+
+    int base = 10;
+    if (text.size() >= 2 && text[0] == '0') {
+        if (text[1] == 'x' || text[1] == 'X') { base = 16; text.erase(0, 2); }
+        else if (text[1] == 'o' || text[1] == 'O') { base = 8; text.erase(0, 2); }
+        else if (text[1] == 'b' || text[1] == 'B') { base = 2; text.erase(0, 2); }
+    }
+    if (had_sign && base != 10) return false;
+    if (text.empty()) return false;
+
+    std::string digits;
+    digits.reserve(text.size());
+    bool previous_separator = false;
+    for (char c : text) {
+        if (c == '_') {
+            if (!allow_separators || digits.empty() || previous_separator) return false;
+            previous_separator = true;
+            continue;
+        }
+        int digit = -1;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'z') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') digit = c - 'A' + 10;
+        if (digit < 0 || digit >= base) return false;
+        digits.push_back(c);
+        previous_separator = false;
+    }
+    if (digits.empty() || previous_separator) return false;
+    if (mpz_set_str(out.get_mpz_t(), digits.c_str(), base) != 0) return false;
+    if (negative) out = -out;
+    return true;
+}
+
+int compare_bigint_number(const mpz_class& bigint, double number) {
+    if (std::isnan(number)) return 2;
+    if (std::isinf(number)) return number > 0 ? -1 : 1;
+    return mpz_cmp_d(bigint.get_mpz_t(), number);
+}
 }  // namespace
 
 Interpreter::Interpreter(heap::Heap& heap) : heap_(heap) {
@@ -38,9 +95,18 @@ Interpreter::Interpreter(heap::Heap& heap) : heap_(heap) {
     promise_proto_ = heap_.alloc<JSObject>();  promise_proto_->proto = object_proto_;
     map_proto_     = heap_.alloc<JSObject>();   map_proto_->proto = object_proto_;
     set_proto_     = heap_.alloc<JSObject>();   set_proto_->proto = object_proto_;
-    function_proto_= heap_.alloc<JSObject>();   function_proto_->proto = object_proto_;
+    auto* callable_function_proto = heap_.alloc<JSFunction>();
+    callable_function_proto->name = u"";
+    callable_function_proto->native =
+        [](Interpreter&, Value, std::vector<Value>&) {
+            return Value::make_undefined();
+        };
+    callable_function_proto->constructable = false;
+    callable_function_proto->proto = object_proto_;
+    function_proto_ = callable_function_proto;
     generator_proto_ = heap_.alloc<JSObject>(); generator_proto_->proto = object_proto_;
     number_proto_  = heap_.alloc<JSObject>();  number_proto_->proto = object_proto_;
+    bigint_proto_  = heap_.alloc<JSObject>();  bigint_proto_->proto = object_proto_;
     boolean_proto_ = heap_.alloc<JSObject>();  boolean_proto_->proto = object_proto_;
     symbol_proto_  = heap_.alloc<JSObject>();  symbol_proto_->proto = object_proto_;
     array_buffer_proto_ = heap_.alloc<JSObject>(); array_buffer_proto_->proto = object_proto_;
@@ -70,12 +136,18 @@ void Interpreter::mark_roots(const heap::Heap::MarkFn& mark) {
     if (function_proto_) mark(Value::make_heap_ptr(function_proto_));
     if (generator_proto_) mark(Value::make_heap_ptr(generator_proto_));
     if (number_proto_) mark(Value::make_heap_ptr(number_proto_));
+    if (bigint_proto_) mark(Value::make_heap_ptr(bigint_proto_));
     if (boolean_proto_) mark(Value::make_heap_ptr(boolean_proto_));
     if (symbol_proto_) mark(Value::make_heap_ptr(symbol_proto_));
     if (array_buffer_proto_) mark(Value::make_heap_ptr(array_buffer_proto_));
     if (typed_array_proto_) mark(Value::make_heap_ptr(typed_array_proto_));
     if (data_view_proto_) mark(Value::make_heap_ptr(data_view_proto_));
     for (Value v : temp_roots_) mark(v);
+    for (JSFunction* fn : call_functions_)
+        if (fn) mark(Value::make_heap_ptr(fn));
+    for (Value receiver : call_receivers_) mark(receiver);
+    for (const auto& arguments : call_arguments_)
+        for (Value argument : arguments) mark(argument);
     for (auto& [k, ref] : dom_wrappers_) { (void)k; if (ref) mark(Value::make_heap_ptr(ref)); }
     auto mark_frame = [&](Frame* f) {
         for (Value v : f->regs) mark(v);
@@ -93,6 +165,10 @@ void Interpreter::mark_roots(const heap::Heap::MarkFn& mark) {
     for (auto& w : gen_frames_) if (auto f = w.lock()) mark_frame(f.get());
     for (auto& mt : microtasks_) for (Value v : mt.roots) mark(v);
     for (Value v : host_roots_) mark(v);
+    for (const auto& [key, symbol] : symbol_registry_) {
+        (void)key;
+        if (symbol) mark(Value::make_heap_ptr(symbol));
+    }
 }
 
 void Interpreter::remove_host_root(Value v) {
@@ -103,6 +179,15 @@ void Interpreter::remove_host_root(Value v) {
 
 // ---- allocation helpers ----
 JSString*   Interpreter::new_string(std::u16string s) { return heap_.alloc<JSString>(std::move(s)); }
+JSBigInt*   Interpreter::new_bigint(mpz_class value) { return heap_.alloc<JSBigInt>(std::move(value)); }
+JSSymbol*   Interpreter::new_symbol(std::u16string description,
+                                    std::u16string property_key) {
+    if (property_key.empty())
+        property_key =
+            u"%symbol:" + u16(std::to_string(next_symbol_id_++));
+    return heap_.alloc<JSSymbol>(
+        std::move(description), std::move(property_key));
+}
 JSObject*   Interpreter::new_object() { auto* o = heap_.alloc<JSObject>(); o->proto = object_proto_; return o; }
 JSArray*    Interpreter::new_array()  { auto* a = heap_.alloc<JSArray>(); a->proto = array_proto_; return a; }
 JSArrayBuffer* Interpreter::new_array_buffer(std::vector<uint8_t> data) {
@@ -117,6 +202,7 @@ Value       Interpreter::str(const std::string& s) { return Value::make_heap_ptr
 JSFunction* Interpreter::new_native(const std::u16string& name, NativeFn fn, uint32_t arity) {
     auto* f = heap_.alloc<JSFunction>();
     f->name = name; f->native = std::move(fn); f->arity = arity;
+    f->proto = function_proto_;
     return f;
 }
 
@@ -152,6 +238,44 @@ Value Interpreter::make_dom_node(malibu::NodeHandle h) {
 }
 
 // ---- conversions ----
+Value Interpreter::to_primitive(Value v, bool prefer_string) {
+    if (!v.is_heap_ptr()) return v;
+    HeapObject::Kind kind = v.as_heap_ptr()->kind;
+    if (kind == HeapObject::kJSString || kind == HeapObject::kJSBigInt ||
+        kind == HeapObject::kJSSymbol)
+        return v;
+
+    auto is_primitive = [](Value value) {
+        if (!value.is_heap_ptr()) return true;
+        HeapObject::Kind value_kind = value.as_heap_ptr()->kind;
+        return value_kind == HeapObject::kJSString ||
+               value_kind == HeapObject::kJSBigInt ||
+               value_kind == HeapObject::kJSSymbol;
+    };
+
+    Value exotic = get_prop(v, u"@@toPrimitive");
+    if (!exotic.is_undefined() && !exotic.is_null()) {
+        if (!is_callable(exotic))
+            throw_error(u"TypeError", u"@@toPrimitive must be callable");
+        std::vector<Value> args{str(prefer_string ? "string" : "number")};
+        Value result = call(exotic, v, args);
+        if (!is_primitive(result))
+            throw_error(u"TypeError", u"@@toPrimitive must return a primitive value");
+        return result;
+    }
+
+    const char16_t* first = prefer_string ? u"toString" : u"valueOf";
+    const char16_t* second = prefer_string ? u"valueOf" : u"toString";
+    for (const char16_t* method_name : {first, second}) {
+        Value method = get_prop(v, method_name);
+        if (!is_callable(method)) continue;
+        std::vector<Value> args;
+        Value result = call(method, v, args);
+        if (is_primitive(result)) return result;
+    }
+    throw_error(u"TypeError", u"Cannot convert object to primitive value");
+}
+
 std::u16string Interpreter::number_to_string(double d) {
     if (std::isnan(d)) return u"NaN";
     if (std::isinf(d)) return d < 0 ? u"-Infinity" : u"Infinity";
@@ -176,6 +300,12 @@ std::u16string Interpreter::to_string(Value v) {
         HeapObject* o = v.as_heap_ptr();
         switch (o->kind) {
             case HeapObject::kJSString: return static_cast<JSString*>(o)->data;
+            case HeapObject::kJSBigInt:
+                return u16(static_cast<JSBigInt*>(o)->value.get_str());
+            case HeapObject::kJSSymbol:
+                throw_error(
+                    u"TypeError",
+                    u"Cannot convert a Symbol value to a string");
             case HeapObject::kJSArray: {
                 auto* a = static_cast<JSArray*>(o);
                 std::u16string out;
@@ -191,21 +321,27 @@ std::u16string Interpreter::to_string(Value v) {
                 return u"function " + f->name + u"() { [code] }";
             }
             case HeapObject::kDomNodeRef: return u"[object Node]";
-            default: {
-                for (const char16_t* method_name : {u"toString", u"valueOf"}) {
-                    Value method = get_prop(v, method_name);
-                    if (!is_callable(method)) continue;
-                    std::vector<Value> args;
-                    Value primitive = call(method, v, args);
-                    if (!primitive.is_heap_ptr() ||
-                        primitive.as_heap_ptr()->kind == HeapObject::kJSString)
-                        return to_string(primitive);
-                }
-                throw_error(u"TypeError", u"Cannot convert object to primitive value");
-            }
+            default: return to_string(to_primitive(v, true));
         }
     }
     return u"undefined";
+}
+
+std::u16string Interpreter::symbol_descriptive_string(Value v) {
+    if (!v.is_heap_ptr() ||
+        v.as_heap_ptr()->kind != HeapObject::kJSSymbol)
+        throw_error(u"TypeError", u"Symbol method called on incompatible receiver");
+    return u"Symbol(" +
+           static_cast<JSSymbol*>(v.as_heap_ptr())->description + u")";
+}
+
+std::u16string Interpreter::to_property_key(Value v) {
+    Value primitive = to_primitive(v, true);
+    if (primitive.is_heap_ptr() &&
+        primitive.as_heap_ptr()->kind == HeapObject::kJSSymbol)
+        return static_cast<JSSymbol*>(
+                   primitive.as_heap_ptr())->property_key;
+    return to_string(primitive);
 }
 
 double Interpreter::to_number(Value v) {
@@ -214,6 +350,11 @@ double Interpreter::to_number(Value v) {
     if (v.is_bool()) return v.as_bool() ? 1.0 : 0.0;
     if (v.is_null()) return 0.0;
     if (v.is_undefined()) return std::nan("");
+    if (is_bigint(v))
+        throw_error(u"TypeError", u"Cannot convert a BigInt value to a number");
+    if (v.is_heap_ptr() &&
+        v.as_heap_ptr()->kind == HeapObject::kJSSymbol)
+        throw_error(u"TypeError", u"Cannot convert a Symbol value to a number");
     if (v.is_heap_ptr() && v.as_heap_ptr()->kind == HeapObject::kJSString) {
         std::u16string& s = static_cast<JSString*>(v.as_heap_ptr())->data;
         std::string narrow_s = narrow(s);
@@ -222,7 +363,42 @@ double Interpreter::to_number(Value v) {
         try { size_t idx; double d = std::stod(narrow_s, &idx); (void)idx; return d; }
         catch (...) { return std::nan(""); }
     }
+    if (v.is_heap_ptr()) return to_number(to_primitive(v));
     return std::nan("");
+}
+
+bool Interpreter::is_bigint(Value v) const {
+    return v.is_heap_ptr() && v.as_heap_ptr()->kind == HeapObject::kJSBigInt;
+}
+
+Value Interpreter::to_bigint(Value v) {
+    if (is_bigint(v)) return v;
+    if (v.is_bool()) return Value::make_heap_ptr(new_bigint(v.as_bool() ? 1 : 0));
+    if (v.is_int32() || v.is_double())
+        throw_error(u"TypeError", u"Cannot convert a number to a BigInt");
+    if (v.is_heap_ptr() && v.as_heap_ptr()->kind == HeapObject::kJSString) {
+        mpz_class result;
+        if (!parse_bigint_text(narrow(static_cast<JSString*>(v.as_heap_ptr())->data), result, false))
+            throw_error(u"SyntaxError", u"Cannot convert string to BigInt");
+        return Value::make_heap_ptr(new_bigint(std::move(result)));
+    }
+    if (v.is_heap_ptr()) return to_bigint(to_primitive(v));
+    throw_error(u"TypeError", u"Cannot convert value to a BigInt");
+}
+
+Value Interpreter::to_bigint_constructor(Value v) {
+    Value primitive = to_primitive(v);
+    if (primitive.is_int32())
+        return Value::make_heap_ptr(new_bigint(primitive.as_int32()));
+    if (primitive.is_double()) {
+        double number = primitive.as_double();
+        if (!std::isfinite(number) || number != std::trunc(number))
+            throw_error(u"RangeError", u"The number cannot be converted to a BigInt because it is not an integer");
+        mpz_class result;
+        mpz_set_d(result.get_mpz_t(), number);
+        return Value::make_heap_ptr(new_bigint(std::move(result)));
+    }
+    return to_bigint(primitive);
 }
 
 bool Interpreter::to_bool(Value v) {
@@ -232,6 +408,7 @@ bool Interpreter::to_bool(Value v) {
     if (v.is_null() || v.is_undefined()) return false;
     if (v.is_heap_ptr() && v.as_heap_ptr()->kind == HeapObject::kJSString)
         return !static_cast<JSString*>(v.as_heap_ptr())->data.empty();
+    if (is_bigint(v)) return static_cast<JSBigInt*>(v.as_heap_ptr())->value != 0;
     return true;
 }
 
@@ -249,6 +426,8 @@ std::u16string Interpreter::js_typeof(Value v) {
     if (v.is_heap_ptr()) {
         switch (v.as_heap_ptr()->kind) {
             case HeapObject::kJSString: return u"string";
+            case HeapObject::kJSBigInt: return u"bigint";
+            case HeapObject::kJSSymbol: return u"symbol";
             case HeapObject::kJSFunction: return u"function";
             case HeapObject::kJSProxy: return is_callable(v) ? u"function" : u"object";
             default: return u"object";
@@ -266,6 +445,8 @@ bool Interpreter::strict_equals(Value a, Value b) {
     if (a.is_undefined() && b.is_undefined()) return true;
     if (a.is_heap_ptr() && b.is_heap_ptr()) {
         HeapObject *oa = a.as_heap_ptr(), *ob = b.as_heap_ptr();
+        if (oa->kind == HeapObject::kJSBigInt && ob->kind == HeapObject::kJSBigInt)
+            return static_cast<JSBigInt*>(oa)->value == static_cast<JSBigInt*>(ob)->value;
         if (oa->kind == HeapObject::kJSString && ob->kind == HeapObject::kJSString)
             return static_cast<JSString*>(oa)->data == static_cast<JSString*>(ob)->data;
         return oa == ob;  // reference identity
@@ -274,15 +455,44 @@ bool Interpreter::strict_equals(Value a, Value b) {
 }
 
 bool Interpreter::loose_equals(Value a, Value b) {
+    if (strict_equals(a, b)) return true;
     if ((a.is_null() || a.is_undefined()) && (b.is_null() || b.is_undefined())) return true;
+    // null and undefined only loosely equal each other. In particular, objects
+    // are not converted to primitives for `object == null`.
+    if (a.is_null() || a.is_undefined() || b.is_null() || b.is_undefined()) return false;
+
+    auto is_object = [](Value value) {
+        return value.is_heap_ptr() &&
+               value.as_heap_ptr()->kind != HeapObject::kJSString &&
+               value.as_heap_ptr()->kind != HeapObject::kJSBigInt &&
+               value.as_heap_ptr()->kind != HeapObject::kJSSymbol;
+    };
     bool an = a.is_int32() || a.is_double(), bn = b.is_int32() || b.is_double();
     bool as = a.is_heap_ptr() && a.as_heap_ptr()->kind == HeapObject::kJSString;
     bool bs = b.is_heap_ptr() && b.as_heap_ptr()->kind == HeapObject::kJSString;
-    if ((an || a.is_bool()) && (bn || b.is_bool())) return to_number(a) == to_number(b);
-    if (an && bs) return to_number(a) == to_number(b);
-    if (as && bn) return to_number(a) == to_number(b);
-    if (as && bs) return to_string(a) == to_string(b);
-    return strict_equals(a, b);
+    bool abi = is_bigint(a), bbi = is_bigint(b);
+
+    if (an && bs) return loose_equals(a, Value::make_double(to_number(b)));
+    if (as && bn) return loose_equals(Value::make_double(to_number(a)), b);
+    if (a.is_bool()) return loose_equals(Value::make_int32(a.as_bool() ? 1 : 0), b);
+    if (b.is_bool()) return loose_equals(a, Value::make_int32(b.as_bool() ? 1 : 0));
+
+    if (abi && bn) {
+        double d = to_number(b);
+        return std::isfinite(d) && d == std::trunc(d) &&
+               compare_bigint_number(static_cast<JSBigInt*>(a.as_heap_ptr())->value, d) == 0;
+    }
+    if (bbi && an) return loose_equals(b, a);
+    if (abi && bs) {
+        mpz_class parsed;
+        return parse_bigint_text(narrow(static_cast<JSString*>(b.as_heap_ptr())->data), parsed, false) &&
+               static_cast<JSBigInt*>(a.as_heap_ptr())->value == parsed;
+    }
+    if (bbi && as) return loose_equals(b, a);
+
+    if (is_object(a) && !is_object(b)) return loose_equals(to_primitive(a), b);
+    if (!is_object(a) && is_object(b)) return loose_equals(a, to_primitive(b));
+    return false;
 }
 
 // ---- property access ----
@@ -321,16 +531,24 @@ void Interpreter::object_set(JSObject* obj, const std::u16string& name, Value v,
 }
 
 Value Interpreter::get_prop(Value obj, const std::u16string& name) {
-    if (obj.is_undefined() || obj.is_null())
+    if (obj.is_undefined() || obj.is_null()) {
+        trace_call_stack("property access on nullish value");
         throw_error(u"TypeError", u"Cannot read properties of " + to_string(obj) +
                                       u" (reading '" + name + u"')");
+    }
     if (is_dom_node(obj)) return dom_get_prop(obj, name);
 
-    // Primitive number / boolean: route through their (shared) wrapper prototype.
+    // Primitive number / bigint / boolean: route through shared wrapper prototypes.
     if (obj.is_double() || obj.is_int32())
         return number_proto_ ? number_proto_->get(name) : Value::make_undefined();
     if (obj.is_bool())
         return boolean_proto_ ? boolean_proto_->get(name) : Value::make_undefined();
+    if (is_bigint(obj))
+        return bigint_proto_ ? bigint_proto_->get(name) : Value::make_undefined();
+    if (obj.is_heap_ptr() &&
+        obj.as_heap_ptr()->kind == HeapObject::kJSSymbol)
+        return symbol_proto_ ? symbol_proto_->get(name)
+                             : Value::make_undefined();
 
     if (obj.is_heap_ptr()) {
         HeapObject* o = obj.as_heap_ptr();
@@ -357,7 +575,10 @@ Value Interpreter::get_prop(Value obj, const std::u16string& name) {
             auto* a = static_cast<JSArray*>(o);
             if (name == u"length") return Value::make_int32(static_cast<int32_t>(a->elements.size()));
             size_t idx;
-            if (parse_index(name, idx)) return idx < a->elements.size() ? a->elements[idx] : Value::make_undefined();
+            if (parse_index(name, idx)) {
+                if (a->has_index(idx)) return a->elements[idx];
+                return object_get(a, name, obj);
+            }
             return object_get(a, name, obj);
         }
         if (o->kind == HeapObject::kTypedArray) {
@@ -399,7 +620,16 @@ Value Interpreter::get_prop(Value obj, const std::u16string& name) {
             // the static-base chain (class `extends`), takes precedence over the
             // intrinsic name/length fields.
             for (JSFunction* cur = f; cur; ) {
-                if (Property* p = cur->find_own(name)) return p->value;
+                if (Property* p = cur->find_own(name)) {
+                    if (p->is_accessor) {
+                        if (p->getter.is_heap_ptr()) {
+                            std::vector<Value> none;
+                            return call(p->getter, obj, none);
+                        }
+                        return Value::make_undefined();
+                    }
+                    return p->value;
+                }
                 Value base = cur->get(u"%staticbase%");
                 cur = (base.is_heap_ptr() && base.as_heap_ptr()->kind == HeapObject::kJSFunction)
                           ? static_cast<JSFunction*>(base.as_heap_ptr()) : nullptr;
@@ -434,14 +664,15 @@ void Interpreter::set_prop(Value obj, const std::u16string& name, Value v, bool 
     if (o->kind == HeapObject::kJSArray) {
         auto* a = static_cast<JSArray*>(o);
         if (name == u"length") {
+            if (!a->length_writable) return;
             size_t n = static_cast<size_t>(std::max(0.0, to_number(v)));
-            a->elements.resize(n, Value::make_undefined());
+            a->resize_length(n, false);
             return;
         }
         size_t idx;
         if (parse_index(name, idx)) {
-            if (idx >= a->elements.size()) a->elements.resize(idx + 1, Value::make_undefined());
-            a->elements[idx] = v;
+            if (idx >= a->elements.size() && !a->length_writable) return;
+            a->set_index(idx, v);
             return;
         }
         object_set(a, name, v, obj, enumerable);
@@ -462,35 +693,134 @@ void Interpreter::set_prop(Value obj, const std::u16string& name, Value v, bool 
         o->kind == HeapObject::kJSGenerator) {
         object_set(static_cast<JSObject*>(o), name, v, obj, enumerable); return;
     }
-    if (o->kind == HeapObject::kJSFunction) { static_cast<JSFunction*>(o)->set(name, v); return; }
+    if (o->kind == HeapObject::kJSFunction) {
+        static_cast<JSFunction*>(o)->set(name, v, enumerable);
+        return;
+    }
 }
 
-Value Interpreter::get_elem(Value obj, Value key) {
-    if (obj.is_heap_ptr() && obj.as_heap_ptr()->kind == HeapObject::kJSArray &&
-        (key.is_int32() || key.is_double())) {
-        auto* a = static_cast<JSArray*>(obj.as_heap_ptr());
-        double d = to_number(key);
-        if (d >= 0 && d == std::floor(d)) {
-            size_t idx = static_cast<size_t>(d);
-            return idx < a->elements.size() ? a->elements[idx] : Value::make_undefined();
+Value Interpreter::get_super_prop(Value base,
+                                  const std::u16string& name,
+                                  Value receiver) {
+    if (base.is_heap_ptr()) {
+        HeapObject* object = base.as_heap_ptr();
+        switch (object->kind) {
+            case HeapObject::kJSObject:
+            case HeapObject::kJSArray:
+            case HeapObject::kJSPromise:
+            case HeapObject::kJSMap:
+            case HeapObject::kJSSet:
+            case HeapObject::kJSGenerator:
+            case HeapObject::kTypedArray:
+            case HeapObject::kDataView:
+                return object_get(
+                    static_cast<JSObject*>(object), name, receiver);
+            default:
+                break;
         }
     }
-    return get_prop(obj, to_string(key));
+    return get_prop(base, name);
 }
 
-void Interpreter::set_elem(Value obj, Value key, Value v, bool enumerable) {
-    if (obj.is_heap_ptr() && obj.as_heap_ptr()->kind == HeapObject::kJSArray &&
-        (key.is_int32() || key.is_double())) {
-        auto* a = static_cast<JSArray*>(obj.as_heap_ptr());
-        double d = to_number(key);
-        if (d >= 0 && d == std::floor(d)) {
-            size_t idx = static_cast<size_t>(d);
-            if (idx >= a->elements.size()) a->elements.resize(idx + 1, Value::make_undefined());
-            a->elements[idx] = v;
+void Interpreter::set_super_prop(Value base,
+                                 const std::u16string& name, Value v,
+                                 Value receiver) {
+    if (base.is_heap_ptr()) {
+        HeapObject* object = base.as_heap_ptr();
+        JSObject* base_object = nullptr;
+        switch (object->kind) {
+            case HeapObject::kJSObject:
+            case HeapObject::kJSArray:
+            case HeapObject::kJSPromise:
+            case HeapObject::kJSMap:
+            case HeapObject::kJSSet:
+            case HeapObject::kJSGenerator:
+            case HeapObject::kTypedArray:
+            case HeapObject::kDataView:
+                base_object = static_cast<JSObject*>(object);
+                break;
+            default:
+                break;
+        }
+        if (base_object) {
+            if (Property* property = base_object->resolve(name)) {
+                if (property->is_accessor) {
+                    if (property->setter.is_heap_ptr()) {
+                        std::vector<Value> arguments{v};
+                        call(property->setter, receiver, arguments);
+                    }
+                    return;
+                }
+                if (!property->writable) return;
+            }
+            set_prop(receiver, name, v);
             return;
         }
     }
-    set_prop(obj, to_string(key), v, enumerable);
+    set_prop(receiver, name, v);
+}
+
+Value Interpreter::get_elem(Value obj, Value key) {
+    if (obj.is_heap_ptr() &&
+        obj.as_heap_ptr()->kind == HeapObject::kJSProxy) {
+        auto* proxy = static_cast<JSProxy*>(obj.as_heap_ptr());
+        Value trap = get_prop(proxy->handler, u"get");
+        if (is_callable(trap)) {
+            Value property_key =
+                key.is_heap_ptr() &&
+                        key.as_heap_ptr()->kind == HeapObject::kJSSymbol
+                    ? key
+                    : str(to_property_key(key));
+            std::vector<Value> arguments{
+                proxy->target, property_key, obj};
+            return call(trap, proxy->handler, arguments);
+        }
+        return get_elem(proxy->target, key);
+    }
+    if (obj.is_heap_ptr() && obj.as_heap_ptr()->kind == HeapObject::kJSArray &&
+        (key.is_int32() || key.is_double())) {
+        auto* a = static_cast<JSArray*>(obj.as_heap_ptr());
+        double d = to_number(key);
+        if (d >= 0 && d == std::floor(d)) {
+            size_t idx = static_cast<size_t>(d);
+            if (a->has_index(idx)) return a->elements[idx];
+            return object_get(a, to_string(key), obj);
+        }
+    }
+    return get_prop(obj, to_property_key(key));
+}
+
+void Interpreter::set_elem(Value obj, Value key, Value v, bool enumerable) {
+    if (obj.is_heap_ptr() &&
+        obj.as_heap_ptr()->kind == HeapObject::kJSProxy) {
+        auto* proxy = static_cast<JSProxy*>(obj.as_heap_ptr());
+        Value trap = get_prop(proxy->handler, u"set");
+        if (is_callable(trap)) {
+            Value property_key =
+                key.is_heap_ptr() &&
+                        key.as_heap_ptr()->kind == HeapObject::kJSSymbol
+                    ? key
+                    : str(to_property_key(key));
+            std::vector<Value> arguments{
+                proxy->target, property_key, v, obj};
+            call(trap, proxy->handler, arguments);
+        } else {
+            set_elem(proxy->target, key, v, enumerable);
+        }
+        return;
+    }
+    if (obj.is_heap_ptr() && obj.as_heap_ptr()->kind == HeapObject::kJSArray &&
+        (key.is_int32() || key.is_double())) {
+        auto* a = static_cast<JSArray*>(obj.as_heap_ptr());
+        double d = to_number(key);
+        if (d >= 0 && d == std::floor(d)) {
+            size_t idx = static_cast<size_t>(d);
+            if (idx >= a->elements.size() && !a->length_writable) return;
+            a->set_index(idx, v);
+            return;
+        }
+    }
+    set_prop(obj, to_property_key(key), v, enumerable);
 }
 
 Value Interpreter::array_or_string_length(Value v) {
@@ -509,8 +839,12 @@ Value Interpreter::make_iterable(Value v, bool keys) {
         HeapObject* o = v.as_heap_ptr();
         if (o->kind == HeapObject::kJSArray) {
             auto* a = static_cast<JSArray*>(o);
-            for (size_t i = 0; i < a->elements.size(); ++i)
-                result->elements.push_back(keys ? str(std::to_string(i)) : a->elements[i]);
+            for (size_t i = 0; i < a->elements.size(); ++i) {
+                if (keys && !a->has_index(i)) continue;
+                result->elements.push_back(keys ? str(std::to_string(i))
+                                                : (a->has_index(i) ? a->elements[i]
+                                                                   : Value::make_undefined()));
+            }
             if (keys) for (auto& p : a->props) if (p.enumerable) result->elements.push_back(str(narrow(p.key)));
         } else if (o->kind == HeapObject::kJSString) {
             auto* s = static_cast<JSString*>(o);
@@ -567,6 +901,58 @@ void Interpreter::drive_iterator(Value iter, JSArray* out) {
 }
 
 // ---- calling ----
+void Interpreter::trace_call_stack(const char* reason) const {
+    if (!std::getenv("MALIBU_TRACE_STACK")) return;
+    auto describe = [](Value value) {
+        if (value.is_undefined()) return std::string("undefined");
+        if (value.is_null()) return std::string("null");
+        if (value.is_bool()) return value.as_bool() ? std::string("true") : std::string("false");
+        if (value.is_int32()) return std::string("i32:") + std::to_string(value.as_int32());
+        if (value.is_double()) return std::string("num:") + std::to_string(value.as_double());
+        if (!value.is_heap_ptr()) return std::string("primitive");
+        HeapObject* object = value.as_heap_ptr();
+        if (object->kind == HeapObject::kJSFunction) {
+            auto* function = static_cast<JSFunction*>(object);
+            return std::string("fn:") + narrow(function->name) + "@" +
+                   std::to_string(reinterpret_cast<uintptr_t>(function));
+        }
+        if (object->kind == HeapObject::kJSString) {
+            std::string text = narrow(static_cast<JSString*>(object)->data);
+            if (text.size() > 24) text.resize(24);
+            return std::string("str:") + text;
+        }
+        if (object->kind == HeapObject::kJSBigInt)
+            return std::string("bigint:") +
+                   static_cast<JSBigInt*>(object)->value.get_str().substr(0, 24);
+        if (object->kind == HeapObject::kJSSymbol)
+            return std::string("symbol:") +
+                   narrow(static_cast<JSSymbol*>(object)->description);
+        return std::string("heap:") + std::to_string(static_cast<int>(object->kind)) +
+               "@" + std::to_string(reinterpret_cast<uintptr_t>(object));
+    };
+
+    std::fprintf(stderr, "[js-stack] %s, depth=%d, most recent calls:\n",
+                 reason, call_depth_);
+    size_t first = call_names_.size() > 48 ? call_names_.size() - 48 : 0;
+    for (size_t i = first; i < call_names_.size(); ++i) {
+        std::string receiver = describe(call_receivers_[i]);
+        std::string arguments;
+        for (Value argument : call_arguments_[i]) {
+            if (!arguments.empty()) arguments += ",";
+            arguments += describe(argument);
+        }
+        std::fprintf(stderr, "  %zu: fn=%p code=%p %s@%u:%u %s this=%s args=[%s]\n", i,
+                     static_cast<void*>(call_functions_[i]),
+                     static_cast<const void*>(call_functions_[i]->code),
+                     call_functions_[i]->code
+                         ? call_functions_[i]->code->source_name.c_str()
+                         : "<native>",
+                     call_functions_[i]->code ? call_functions_[i]->code->source_line : 0,
+                     call_functions_[i]->code ? call_functions_[i]->code->source_column : 0,
+                     narrow(call_names_[i]).c_str(), receiver.c_str(), arguments.c_str());
+    }
+}
+
 Value Interpreter::call(Value callee, Value this_val, std::vector<Value>& args) {
     // Proxy [[Call]]: invoke the `apply` trap (target, thisArg, argList) or
     // forward to the target.
@@ -580,12 +966,82 @@ Value Interpreter::call(Value callee, Value this_val, std::vector<Value>& args) 
         }
         return call(px->target, this_val, args);
     }
-    if (!callee.is_heap_ptr() || callee.as_heap_ptr()->kind != HeapObject::kJSFunction)
+    if (!callee.is_heap_ptr() || callee.as_heap_ptr()->kind != HeapObject::kJSFunction) {
+        if (std::getenv("MALIBU_TRACE_STACK") && callee.is_heap_ptr()) {
+            HeapObject* value = callee.as_heap_ptr();
+            JSObject* object = nullptr;
+            switch (value->kind) {
+                case HeapObject::kJSObject:
+                case HeapObject::kJSArray:
+                case HeapObject::kJSPromise:
+                case HeapObject::kJSMap:
+                case HeapObject::kJSSet:
+                case HeapObject::kJSGenerator:
+                case HeapObject::kArrayBuffer:
+                case HeapObject::kTypedArray:
+                case HeapObject::kDataView:
+                case HeapObject::kJSProxy:
+                    object = static_cast<JSObject*>(value);
+                    break;
+                default:
+                    break;
+            }
+            if (object) {
+                std::string own_keys;
+                for (size_t i = 0; i < object->props.size() && i < 12; ++i) {
+                    if (!own_keys.empty()) own_keys += ",";
+                    own_keys += narrow(object->props[i].key);
+                }
+                std::string proto_keys;
+                if (object->proto) {
+                    for (size_t i = 0;
+                         i < object->proto->props.size() && i < 12; ++i) {
+                        if (!proto_keys.empty()) proto_keys += ",";
+                        proto_keys += narrow(object->proto->props[i].key);
+                    }
+                }
+                std::fprintf(
+                    stderr,
+                    "[js-noncallable] kind=%d object=%p own={%s} proto=%p "
+                    "proto-own={%s}\n",
+                    static_cast<int>(value->kind), static_cast<void*>(object),
+                    own_keys.c_str(), static_cast<void*>(object->proto),
+                    proto_keys.c_str());
+            }
+        }
+        trace_call_stack("attempted to call a non-callable value");
         throw_error(u"TypeError", to_string(callee) + u" is not a function");
+    }
     auto* fn = static_cast<JSFunction*>(callee.as_heap_ptr());
 
-    if (++call_depth_ > kMaxCallDepth) { --call_depth_; throw_error(u"RangeError", u"Maximum call stack size exceeded"); }
-    struct DepthGuard { int& d; ~DepthGuard() { --d; } } guard{call_depth_};
+    ++call_depth_;
+    call_names_.push_back(fn->name);
+    call_functions_.push_back(fn);
+    call_receivers_.push_back(this_val);
+    call_arguments_.emplace_back(args.begin(), args.begin() + std::min<size_t>(args.size(), 4));
+    if (call_depth_ > kMaxCallDepth) {
+        trace_call_stack("maximum call depth exceeded");
+        call_arguments_.pop_back();
+        call_receivers_.pop_back();
+        call_functions_.pop_back();
+        call_names_.pop_back();
+        --call_depth_;
+        throw_error(u"RangeError", u"Maximum call stack size exceeded");
+    }
+    struct DepthGuard {
+        int& d;
+        std::vector<std::u16string>& names;
+        std::vector<JSFunction*>& functions;
+        std::vector<Value>& receivers;
+        std::vector<std::vector<Value>>& arguments;
+        ~DepthGuard() {
+            arguments.pop_back();
+            receivers.pop_back();
+            functions.pop_back();
+            names.pop_back();
+            --d;
+        }
+    } guard{call_depth_, call_names_, call_functions_, call_receivers_, call_arguments_};
 
     if (fn->is_native()) return fn->native(*this, this_val, args);
     if (fn->code && fn->code->is_generator) return make_generator(fn, this_val, args);
@@ -598,6 +1054,11 @@ Value Interpreter::call(Value callee, Value this_val, std::vector<Value>& args) 
     frame.env = heap_.alloc<Environment>();
     frame.env->parent = fn->closure;
     frame.env->is_function_scope = true;
+    if (fn->code->has_name_binding &&
+        !fn->code->name.empty())
+        frame.env->define(
+            fn->code->name,
+            Value::make_heap_ptr(fn));
     // Non-arrow functions own `this`; arrows inherit %this% via the closure chain.
     if (!fn->code->is_arrow) frame.env->define(u"%this%", this_val);
     for (size_t i = 0; i < fn->code->param_names.size(); ++i)
@@ -634,13 +1095,18 @@ namespace {
 Value clone_rec(Interpreter& in, Value v, std::vector<std::pair<HeapObject*, Value>>& seen) {
     if (!v.is_heap_ptr()) return v;
     HeapObject* o = v.as_heap_ptr();
-    if (o->kind == HeapObject::kJSString || o->kind == HeapObject::kJSFunction) return v;
+    if (o->kind == HeapObject::kJSString || o->kind == HeapObject::kJSBigInt ||
+        o->kind == HeapObject::kJSSymbol ||
+        o->kind == HeapObject::kJSFunction) return v;
     for (auto& [k, c] : seen) if (k == o) return c;  // preserve shared/cyclic refs
     switch (o->kind) {
         case HeapObject::kJSArray: {
             auto* a = static_cast<JSArray*>(o); JSArray* c = in.new_array();
             Value cv = Value::make_heap_ptr(c); seen.emplace_back(o, cv);
-            for (Value e : a->elements) c->elements.push_back(clone_rec(in, e, seen));
+            for (size_t i = 0; i < a->elements.size(); ++i)
+                c->append(a->has_index(i) ? clone_rec(in, a->elements[i], seen)
+                                          : Value::make_undefined(),
+                          a->has_index(i));
             for (auto& p : a->props) if (p.enumerable && !p.is_accessor) c->set(p.key, clone_rec(in, p.value, seen));
             return cv;
         }
@@ -682,6 +1148,19 @@ Value Interpreter::construct(Value callee, std::vector<Value>& args) {
     if (!callee.is_heap_ptr() || callee.as_heap_ptr()->kind != HeapObject::kJSFunction)
         throw_error(u"TypeError", to_string(callee) + u" is not a constructor");
     auto* fn = static_cast<JSFunction*>(callee.as_heap_ptr());
+    if (fn->get(u"%isBound%").is_bool() &&
+        fn->get(u"%isBound%").as_bool()) {
+        Value target = fn->get(u"%target%");
+        Value bound_args = fn->get(u"%boundArgs%");
+        std::vector<Value> all;
+        if (bound_args.is_heap_ptr() &&
+            bound_args.as_heap_ptr()->kind == HeapObject::kJSArray)
+            all = static_cast<JSArray*>(bound_args.as_heap_ptr())->elements;
+        all.insert(all.end(), args.begin(), args.end());
+        return construct(target, all);
+    }
+    if (!fn->constructable)
+        throw_error(u"TypeError", fn->name + u" is not a constructor");
     JSObject* obj = new_object();
     Value proto = fn->get(u"prototype");
     if (proto.is_heap_ptr() && proto.as_heap_ptr()->kind == HeapObject::kJSObject)
@@ -689,24 +1168,32 @@ Value Interpreter::construct(Value callee, std::vector<Value>& args) {
     Value this_val = Value::make_heap_ptr(obj);
     Value result = call(callee, this_val, args);
     if (result.is_heap_ptr() && result.as_heap_ptr()->kind != HeapObject::kJSString &&
-        result.as_heap_ptr()->kind != HeapObject::kDomNodeRef &&
+        result.as_heap_ptr()->kind != HeapObject::kJSBigInt &&
+        result.as_heap_ptr()->kind != HeapObject::kJSSymbol &&
         result.as_heap_ptr()->kind != HeapObject::kEnvironment)
         return result;  // any object-like return value replaces the fresh `this`
     return this_val;
 }
 
-Value Interpreter::run_program(const compiler::Function* program) {
+Value Interpreter::run_program(const compiler::Function* program,
+                               bool isolated_top_level) {
     Frame frame;
     frame.fn = program;
     frame.regs.assign(program->num_registers, Value::make_undefined());
-    // Top-level declarations persist in the global scope (REPL-style), so
-    // successive evaluate() calls share state.
-    frame.env = global_;
+    if (isolated_top_level) {
+        frame.env = heap_.alloc<Environment>();
+        frame.env->parent = global_;
+        frame.env->is_function_scope = true;
+    } else {
+        // Classic scripts and REPL evaluations share the global environment.
+        frame.env = global_;
+    }
     frame.this_val = Value::make_heap_ptr(global_object_);  // sloppy global `this`
     return run_frame(frame);
 }
 
 bool Interpreter::unwind_to_handler(Frame& frame, Value exc) {
+    frame.pending_return = false;
     while (!frame.handlers.empty()) {
         Handler h = frame.handlers.back();
         frame.handlers.pop_back();
@@ -720,6 +1207,21 @@ bool Interpreter::unwind_to_handler(Frame& frame, Value exc) {
         if (h.flags & 2) {  // finally only
             frame.pending_exc = true;
             frame.exc_value = exc;
+            frame.pc = static_cast<size_t>(h.finally_pc);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Interpreter::unwind_return_to_finally(Frame& frame) {
+    frame.pending_exc = false;
+    while (!frame.handlers.empty()) {
+        Handler h = frame.handlers.back();
+        frame.handlers.pop_back();
+        frame.env = h.saved_env;
+        if (h.flags & 2) {
+            frame.pending_return = true;
             frame.pc = static_cast<size_t>(h.finally_pc);
             return true;
         }
@@ -743,6 +1245,14 @@ Value Interpreter::run_frame(Frame& frame) {
                 case OpCode::Nop: break;
                 case OpCode::Move: regs[in.dst] = regs[in.src_a]; break;
                 case OpCode::LoadConst: regs[in.dst] = f.num_consts[static_cast<uint16_t>(in.imm16)]; break;
+                case OpCode::LoadBigInt: {
+                    mpz_class value;
+                    if (!parse_bigint_text(f.bigint_consts[static_cast<uint16_t>(in.imm16)],
+                                           value, true))
+                        throw_error(u"SyntaxError", u"Invalid BigInt literal");
+                    regs[in.dst] = Value::make_heap_ptr(new_bigint(std::move(value)));
+                    break;
+                }
                 case OpCode::LoadString: regs[in.dst] = str(narrow(f.str_consts[static_cast<uint16_t>(in.imm16)])); break;
                 case OpCode::LoadUndefined: regs[in.dst] = Value::make_undefined(); break;
                 case OpCode::LoadNull: regs[in.dst] = Value::make_null(); break;
@@ -751,8 +1261,12 @@ Value Interpreter::run_frame(Frame& frame) {
 
                 case OpCode::DefineVar: {
                     const std::u16string& name = f.str_consts[static_cast<uint16_t>(in.imm16)];
-                    Environment* target = (in.dst == 1) ? frame.env->function_scope() : frame.env;
-                    target->define(name, regs[in.src_a]);
+                    Environment* target =
+                        in.dst == 0 ? frame.env : frame.env->function_scope();
+                    if (in.dst == 2)
+                        target->define_if_absent(name, regs[in.src_a]);
+                    else
+                        target->define(name, regs[in.src_a]);
                     break;
                 }
                 case OpCode::LoadVar: {
@@ -798,9 +1312,23 @@ Value Interpreter::run_frame(Frame& frame) {
                 }
 
                 case OpCode::Add: {
-                    Value a = regs[in.src_a], b = regs[in.src_b];
+                    Value a = to_primitive(regs[in.src_a]);
+                    Value b = to_primitive(regs[in.src_b]);
                     bool as = a.is_heap_ptr() && a.as_heap_ptr()->kind == HeapObject::kJSString;
                     bool bs = b.is_heap_ptr() && b.as_heap_ptr()->kind == HeapObject::kJSString;
+                    if (as || bs) {
+                        regs[in.dst] = str(narrow(to_string(a) + to_string(b)));
+                        break;
+                    }
+                    bool abi = is_bigint(a), bbi = is_bigint(b);
+                    if (abi || bbi) {
+                        if (!abi || !bbi)
+                            throw_error(u"TypeError", u"Cannot mix BigInt and other types");
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(
+                            static_cast<JSBigInt*>(a.as_heap_ptr())->value +
+                            static_cast<JSBigInt*>(b.as_heap_ptr())->value));
+                        break;
+                    }
                     bool ao = a.is_heap_ptr() && !as, bo = b.is_heap_ptr() && !bs;
                     if (as || bs || ao || bo) regs[in.dst] = str(narrow(to_string(a) + to_string(b)));
                     else {
@@ -810,30 +1338,162 @@ Value Interpreter::run_frame(Frame& frame) {
                     }
                     break;
                 }
-                case OpCode::Sub: regs[in.dst] = Value::make_double(to_number(regs[in.src_a]) - to_number(regs[in.src_b])); break;
-                case OpCode::Mul: regs[in.dst] = Value::make_double(to_number(regs[in.src_a]) * to_number(regs[in.src_b])); break;
-                case OpCode::Div: regs[in.dst] = Value::make_double(to_number(regs[in.src_a]) / to_number(regs[in.src_b])); break;
-                case OpCode::Mod: regs[in.dst] = Value::make_double(std::fmod(to_number(regs[in.src_a]), to_number(regs[in.src_b]))); break;
-                case OpCode::Pow: regs[in.dst] = Value::make_double(std::pow(to_number(regs[in.src_a]), to_number(regs[in.src_b]))); break;
-                case OpCode::Neg: regs[in.dst] = Value::make_double(-to_number(regs[in.src_a])); break;
-                case OpCode::BitNot: regs[in.dst] = Value::make_int32(~to_int32(regs[in.src_a])); break;
-                case OpCode::BitAnd: regs[in.dst] = Value::make_int32(to_int32(regs[in.src_a]) & to_int32(regs[in.src_b])); break;
-                case OpCode::BitOr:  regs[in.dst] = Value::make_int32(to_int32(regs[in.src_a]) | to_int32(regs[in.src_b])); break;
-                case OpCode::BitXor: regs[in.dst] = Value::make_int32(to_int32(regs[in.src_a]) ^ to_int32(regs[in.src_b])); break;
-                case OpCode::Shl: regs[in.dst] = Value::make_int32(to_int32(regs[in.src_a]) << (to_int32(regs[in.src_b]) & 31)); break;
-                case OpCode::Shr: regs[in.dst] = Value::make_int32(to_int32(regs[in.src_a]) >> (to_int32(regs[in.src_b]) & 31)); break;
-                case OpCode::UShr: regs[in.dst] = Value::make_int32(static_cast<int32_t>(static_cast<uint32_t>(to_int32(regs[in.src_a])) >> (to_int32(regs[in.src_b]) & 31))); break;
+                case OpCode::Sub: case OpCode::Mul: case OpCode::Div: case OpCode::Mod:
+                case OpCode::BitAnd: case OpCode::BitOr: case OpCode::BitXor: {
+                    Value a = to_primitive(regs[in.src_a]);
+                    Value b = to_primitive(regs[in.src_b]);
+                    bool abi = is_bigint(a), bbi = is_bigint(b);
+                    if (abi || bbi) {
+                        if (!abi || !bbi)
+                            throw_error(u"TypeError", u"Cannot mix BigInt and other types");
+                        const mpz_class& x = static_cast<JSBigInt*>(a.as_heap_ptr())->value;
+                        const mpz_class& y = static_cast<JSBigInt*>(b.as_heap_ptr())->value;
+                        mpz_class result;
+                        if (in.op == OpCode::Sub) result = x - y;
+                        else if (in.op == OpCode::Mul) result = x * y;
+                        else if (in.op == OpCode::Div) {
+                            if (y == 0) throw_error(u"RangeError", u"Division by zero");
+                            mpz_tdiv_q(result.get_mpz_t(), x.get_mpz_t(), y.get_mpz_t());
+                        } else if (in.op == OpCode::Mod) {
+                            if (y == 0) throw_error(u"RangeError", u"Division by zero");
+                            mpz_tdiv_r(result.get_mpz_t(), x.get_mpz_t(), y.get_mpz_t());
+                        } else if (in.op == OpCode::BitAnd) result = x & y;
+                        else if (in.op == OpCode::BitOr) result = x | y;
+                        else result = x ^ y;
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(std::move(result)));
+                    } else if (in.op == OpCode::Sub) {
+                        regs[in.dst] = Value::make_double(to_number(a) - to_number(b));
+                    } else if (in.op == OpCode::Mul) {
+                        regs[in.dst] = Value::make_double(to_number(a) * to_number(b));
+                    } else if (in.op == OpCode::Div) {
+                        regs[in.dst] = Value::make_double(to_number(a) / to_number(b));
+                    } else if (in.op == OpCode::Mod) {
+                        regs[in.dst] = Value::make_double(std::fmod(to_number(a), to_number(b)));
+                    } else if (in.op == OpCode::BitAnd) {
+                        regs[in.dst] = Value::make_int32(to_int32(a) & to_int32(b));
+                    } else if (in.op == OpCode::BitOr) {
+                        regs[in.dst] = Value::make_int32(to_int32(a) | to_int32(b));
+                    } else {
+                        regs[in.dst] = Value::make_int32(to_int32(a) ^ to_int32(b));
+                    }
+                    break;
+                }
+                case OpCode::Pow: {
+                    Value a = to_primitive(regs[in.src_a]);
+                    Value b = to_primitive(regs[in.src_b]);
+                    bool abi = is_bigint(a), bbi = is_bigint(b);
+                    if (abi || bbi) {
+                        if (!abi || !bbi)
+                            throw_error(u"TypeError", u"Cannot mix BigInt and other types");
+                        const mpz_class& exponent = static_cast<JSBigInt*>(b.as_heap_ptr())->value;
+                        if (exponent < 0) throw_error(u"RangeError", u"BigInt exponent must be positive");
+                        if (!mpz_fits_ulong_p(exponent.get_mpz_t()))
+                            throw_error(u"RangeError", u"BigInt exponent is too large");
+                        mpz_class result;
+                        mpz_pow_ui(result.get_mpz_t(),
+                                   static_cast<JSBigInt*>(a.as_heap_ptr())->value.get_mpz_t(),
+                                   exponent.get_ui());
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(std::move(result)));
+                    } else {
+                        regs[in.dst] = Value::make_double(std::pow(to_number(a), to_number(b)));
+                    }
+                    break;
+                }
+                case OpCode::Neg: {
+                    Value value = to_primitive(regs[in.src_a]);
+                    if (is_bigint(value))
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(
+                            -static_cast<JSBigInt*>(value.as_heap_ptr())->value));
+                    else regs[in.dst] = Value::make_double(-to_number(value));
+                    break;
+                }
+                case OpCode::BitNot: {
+                    Value value = to_primitive(regs[in.src_a]);
+                    if (is_bigint(value))
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(
+                            ~static_cast<JSBigInt*>(value.as_heap_ptr())->value));
+                    else regs[in.dst] = Value::make_int32(~to_int32(value));
+                    break;
+                }
+                case OpCode::Shl: case OpCode::Shr: {
+                    Value a = to_primitive(regs[in.src_a]);
+                    Value b = to_primitive(regs[in.src_b]);
+                    bool abi = is_bigint(a), bbi = is_bigint(b);
+                    if (abi || bbi) {
+                        if (!abi || !bbi)
+                            throw_error(u"TypeError", u"Cannot mix BigInt and other types");
+                        const mpz_class& shift_value = static_cast<JSBigInt*>(b.as_heap_ptr())->value;
+                        if (!mpz_fits_slong_p(shift_value.get_mpz_t()))
+                            throw_error(u"RangeError", u"BigInt shift count is too large");
+                        long shift = shift_value.get_si();
+                        if (in.op == OpCode::Shr) shift = -shift;
+                        mpz_class result;
+                        const mpz_class& value = static_cast<JSBigInt*>(a.as_heap_ptr())->value;
+                        if (shift >= 0)
+                            mpz_mul_2exp(result.get_mpz_t(), value.get_mpz_t(),
+                                         static_cast<unsigned long>(shift));
+                        else
+                            mpz_fdiv_q_2exp(result.get_mpz_t(), value.get_mpz_t(),
+                                            static_cast<unsigned long>(-shift));
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(std::move(result)));
+                    } else if (in.op == OpCode::Shl) {
+                        regs[in.dst] = Value::make_int32(to_int32(a) << (to_int32(b) & 31));
+                    } else {
+                        regs[in.dst] = Value::make_int32(to_int32(a) >> (to_int32(b) & 31));
+                    }
+                    break;
+                }
+                case OpCode::UShr:
+                    regs[in.src_a] = to_primitive(regs[in.src_a]);
+                    regs[in.src_b] = to_primitive(regs[in.src_b]);
+                    if (is_bigint(regs[in.src_a]) || is_bigint(regs[in.src_b]))
+                        throw_error(u"TypeError", u"BigInts have no unsigned right shift");
+                    regs[in.dst] = Value::make_int32(static_cast<int32_t>(
+                        static_cast<uint32_t>(to_int32(regs[in.src_a])) >>
+                        (to_int32(regs[in.src_b]) & 31)));
+                    break;
+                case OpCode::Inc: case OpCode::Dec: {
+                    Value value = to_primitive(regs[in.src_a]);
+                    if (is_bigint(value)) {
+                        const mpz_class& x = static_cast<JSBigInt*>(value.as_heap_ptr())->value;
+                        mpz_class result = x;
+                        if (in.op == OpCode::Inc) ++result;
+                        else --result;
+                        regs[in.dst] = Value::make_heap_ptr(new_bigint(std::move(result)));
+                    } else {
+                        double x = to_number(value);
+                        regs[in.dst] = Value::make_double(in.op == OpCode::Inc ? x + 1 : x - 1);
+                    }
+                    break;
+                }
 
                 case OpCode::Eq:  regs[in.dst] = Value::make_bool(loose_equals(regs[in.src_a], regs[in.src_b])); break;
                 case OpCode::NEq: regs[in.dst] = Value::make_bool(!loose_equals(regs[in.src_a], regs[in.src_b])); break;
                 case OpCode::StrictEq:  regs[in.dst] = Value::make_bool(strict_equals(regs[in.src_a], regs[in.src_b])); break;
                 case OpCode::StrictNEq: regs[in.dst] = Value::make_bool(!strict_equals(regs[in.src_a], regs[in.src_b])); break;
                 case OpCode::Lt: case OpCode::Lte: case OpCode::Gt: case OpCode::Gte: {
-                    Value a = regs[in.src_a], b = regs[in.src_b];
+                    Value a = to_primitive(regs[in.src_a]);
+                    Value b = to_primitive(regs[in.src_b]);
                     bool as = a.is_heap_ptr() && a.as_heap_ptr()->kind == HeapObject::kJSString;
                     bool bs = b.is_heap_ptr() && b.as_heap_ptr()->kind == HeapObject::kJSString;
                     bool res;
-                    if (as && bs) {
+                    if (is_bigint(a) || is_bigint(b)) {
+                        int cmp = 2;
+                        if (is_bigint(a) && is_bigint(b)) {
+                            cmp = mpz_cmp(static_cast<JSBigInt*>(a.as_heap_ptr())->value.get_mpz_t(),
+                                          static_cast<JSBigInt*>(b.as_heap_ptr())->value.get_mpz_t());
+                        } else if (is_bigint(a)) {
+                            cmp = compare_bigint_number(
+                                static_cast<JSBigInt*>(a.as_heap_ptr())->value, to_number(b));
+                        } else {
+                            int reverse = compare_bigint_number(
+                                static_cast<JSBigInt*>(b.as_heap_ptr())->value, to_number(a));
+                            cmp = reverse == 2 ? 2 : -reverse;
+                        }
+                        res = cmp != 2 && (in.op == OpCode::Lt ? cmp < 0 :
+                                          in.op == OpCode::Lte ? cmp <= 0 :
+                                          in.op == OpCode::Gt ? cmp > 0 : cmp >= 0);
+                    } else if (as && bs) {
                         auto& x = static_cast<JSString*>(a.as_heap_ptr())->data;
                         auto& y = static_cast<JSString*>(b.as_heap_ptr())->data;
                         res = in.op == OpCode::Lt ? x < y : in.op == OpCode::Lte ? x <= y : in.op == OpCode::Gt ? x > y : x >= y;
@@ -848,35 +1508,91 @@ Value Interpreter::run_frame(Frame& frame) {
                 case OpCode::TypeOf: regs[in.dst] = str(narrow(js_typeof(regs[in.src_a]))); break;
                 case OpCode::In: {
                     Value k = regs[in.src_a], o = regs[in.src_b];
+                    if (!o.is_heap_ptr() ||
+                        o.as_heap_ptr()->kind == HeapObject::kJSString ||
+                        o.as_heap_ptr()->kind == HeapObject::kJSBigInt ||
+                        o.as_heap_ptr()->kind == HeapObject::kEnvironment)
+                        throw_error(
+                            u"TypeError",
+                            u"right-hand side of 'in' is not an object");
                     bool present = false;
-                    if (o.is_heap_ptr()) {
-                        std::u16string key = to_string(k);
-                        HeapObject* obj = o.as_heap_ptr();
-                        if (obj->kind == HeapObject::kJSProxy) {
-                            auto* px = static_cast<JSProxy*>(obj);
-                            Value trap = get_prop(px->handler, u"has");
-                            if (is_callable(trap)) {
-                                std::vector<Value> a{px->target, str(key)};
-                                present = to_bool(call(trap, px->handler, a));
+                    std::u16string key = to_property_key(k);
+                    HeapObject* obj = o.as_heap_ptr();
+                    if (obj->kind == HeapObject::kJSProxy) {
+                        auto* px = static_cast<JSProxy*>(obj);
+                        Value trap = get_prop(px->handler, u"has");
+                        if (is_callable(trap)) {
+                            Value property_key =
+                                k.is_heap_ptr() &&
+                                        k.as_heap_ptr()->kind ==
+                                            HeapObject::kJSSymbol
+                                    ? k
+                                    : str(key);
+                            std::vector<Value> a{
+                                px->target, property_key};
+                            present = to_bool(call(trap, px->handler, a));
+                        } else {
+                            Value target = px->target;
+                            if (!target.is_heap_ptr())
+                                throw_error(
+                                    u"TypeError",
+                                    u"Proxy target is not an object");
+                            HeapObject* target_object =
+                                target.as_heap_ptr();
+                            if (target_object->kind ==
+                                HeapObject::kJSFunction) {
+                                auto* function =
+                                    static_cast<JSFunction*>(
+                                        target_object);
+                                present =
+                                    function->find_own(key) != nullptr ||
+                                    function_proto_->has(key);
                             } else {
-                                std::vector<Value> none;  // forward: key in target
-                                Value tv = px->target;
-                                if (tv.is_heap_ptr() && (tv.as_heap_ptr()->kind == HeapObject::kJSObject ||
-                                                         tv.as_heap_ptr()->kind == HeapObject::kJSArray))
-                                    present = static_cast<JSObject*>(tv.as_heap_ptr())->has(key);
-                                (void)none;
-                            }
-                        } else if (obj->kind == HeapObject::kJSObject || obj->kind == HeapObject::kJSArray ||
-                                   obj->kind == HeapObject::kTypedArray) {
-                            if (obj->kind == HeapObject::kTypedArray) {
-                                auto* ta = static_cast<JSTypedArray*>(obj);
-                                size_t idx;
-                                if (parse_index(key, idx) && idx < ta->length) { present = true; }
-                                else present = ta->has(key);
-                            } else {
-                                present = static_cast<JSObject*>(obj)->has(key);
+                                present =
+                                    static_cast<JSObject*>(
+                                        target_object)
+                                        ->has(key);
                             }
                         }
+                    } else if (obj->kind == HeapObject::kJSFunction) {
+                        auto* function = static_cast<JSFunction*>(obj);
+                        for (JSFunction* current = function; current;) {
+                            if (current->find_own(key)) {
+                                present = true;
+                                break;
+                            }
+                            Value base =
+                                current->get(u"%staticbase%");
+                            current =
+                                base.is_heap_ptr() &&
+                                        base.as_heap_ptr()->kind ==
+                                            HeapObject::kJSFunction
+                                    ? static_cast<JSFunction*>(
+                                          base.as_heap_ptr())
+                                    : nullptr;
+                        }
+                        if (!present)
+                            present =
+                                key == u"name" || key == u"length" ||
+                                function_proto_->has(key);
+                    } else if (obj->kind == HeapObject::kTypedArray) {
+                        auto* typed = static_cast<JSTypedArray*>(obj);
+                        size_t index;
+                        present =
+                            (parse_index(key, index) &&
+                             index < typed->length) ||
+                            typed->has(key);
+                    } else if (obj->kind == HeapObject::kJSArray) {
+                        auto* array = static_cast<JSArray*>(obj);
+                        size_t index;
+                        present =
+                            (parse_index(key, index) && array->has_index(index)) ||
+                            array->has(key);
+                    } else if (obj->kind == HeapObject::kDomNodeRef) {
+                        present = !dom_get_prop(o, key).is_undefined();
+                    } else {
+                        present =
+                            static_cast<JSObject*>(obj)->has(key);
                     }
                     regs[in.dst] = Value::make_bool(present);
                     break;
@@ -884,15 +1600,84 @@ Value Interpreter::run_frame(Frame& frame) {
                 case OpCode::InstanceOf: {
                     Value o = regs[in.src_a], ctor = regs[in.src_b];
                     bool res = false;
+                    for (size_t depth = 0;
+                         depth < 1024 && ctor.is_heap_ptr() &&
+                         ctor.as_heap_ptr()->kind == HeapObject::kJSFunction;
+                         ++depth) {
+                        auto* function =
+                            static_cast<JSFunction*>(ctor.as_heap_ptr());
+                        Value is_bound = function->get(u"%isBound%");
+                        if (!is_bound.is_bool() || !is_bound.as_bool()) break;
+                        ctor = function->get(u"%target%");
+                    }
                     if (o.is_heap_ptr() && ctor.is_heap_ptr() && ctor.as_heap_ptr()->kind == HeapObject::kJSFunction) {
-                        Value proto = static_cast<JSFunction*>(ctor.as_heap_ptr())->get(u"prototype");
+                        auto* ctor_function =
+                            static_cast<JSFunction*>(ctor.as_heap_ptr());
+                        Value proto = ctor_function->get(u"prototype");
                         HeapObject::Kind k = o.as_heap_ptr()->kind;
+                        if (k == HeapObject::kDomNodeRef) {
+                            Value marker =
+                                ctor_function->get(u"__domInterface");
+                            if (!marker.is_undefined()) {
+                                const std::u16string interface_name =
+                                    to_string(marker);
+                                const int node_type = to_int32(
+                                    dom_get_prop(o, u"nodeType"));
+                                const std::u16string tag =
+                                    to_string(dom_get_prop(o, u"tagName"));
+                                const bool element = node_type == 1;
+                                const bool html_element =
+                                    element && tag != u"SVG";
+                                if (interface_name == u"Node" ||
+                                    interface_name == u"EventTarget")
+                                    res = true;
+                                else if (interface_name == u"Element")
+                                    res = element;
+                                else if (interface_name == u"HTMLElement")
+                                    res = html_element;
+                                else if (interface_name ==
+                                         u"HTMLMediaElement")
+                                    res = tag == u"AUDIO" || tag == u"VIDEO";
+                                else if (interface_name ==
+                                         u"HTMLAudioElement")
+                                    res = tag == u"AUDIO";
+                                else if (interface_name ==
+                                         u"HTMLImageElement")
+                                    res = tag == u"IMG";
+                                else if (interface_name ==
+                                         u"HTMLDivElement")
+                                    res = tag == u"DIV";
+                                else if (interface_name ==
+                                         u"HTMLSpanElement")
+                                    res = tag == u"SPAN";
+                                else if (interface_name ==
+                                         u"HTMLInputElement")
+                                    res = tag == u"INPUT";
+                                else if (interface_name ==
+                                         u"HTMLAnchorElement")
+                                    res = tag == u"A";
+                                else if (interface_name ==
+                                         u"HTMLButtonElement")
+                                    res = tag == u"BUTTON";
+                                else if (interface_name ==
+                                         u"HTMLParagraphElement")
+                                    res = tag == u"P";
+                                else if (interface_name ==
+                                         u"HTMLVideoElement")
+                                    res = tag == u"VIDEO";
+                                else if (interface_name == u"SVGElement")
+                                    res = tag == u"SVG";
+                            }
+                        }
                         // Every JSObject-derived kind carries a proto chain.
-                        if (k == HeapObject::kJSObject || k == HeapObject::kJSArray ||
+                        if (!res &&
+                            (k == HeapObject::kJSObject ||
+                             k == HeapObject::kJSArray ||
+                            k == HeapObject::kJSFunction ||
                             k == HeapObject::kJSPromise || k == HeapObject::kJSMap ||
                             k == HeapObject::kJSSet || k == HeapObject::kJSGenerator ||
                             k == HeapObject::kTypedArray || k == HeapObject::kDataView ||
-                            k == HeapObject::kArrayBuffer) {
+                             k == HeapObject::kArrayBuffer)) {
                             JSObject* p = static_cast<JSObject*>(o.as_heap_ptr())->proto;
                             while (p) { if (Value::make_heap_ptr(p) == proto) { res = true; break; } p = p->proto; }
                         }
@@ -918,10 +1703,12 @@ Value Interpreter::run_frame(Frame& frame) {
                     JSFunction* fn = heap_.alloc<JSFunction>();
                     fn->name = tmpl->name; fn->arity = tmpl->arity;
                     fn->code = tmpl.get(); fn->closure = frame.env;
+                    fn->proto = function_proto_;
                     // every function gets a fresh .prototype object
                     JSObject* proto = new_object();
                     proto->set(u"constructor", Value::make_heap_ptr(fn), false);
-                    fn->set(u"prototype", Value::make_heap_ptr(proto));
+                    fn->set(u"prototype", Value::make_heap_ptr(proto), false);
+                    fn->find_own(u"prototype")->configurable = false;
                     regs[in.dst] = Value::make_heap_ptr(fn);
                     break;
                 }
@@ -930,6 +1717,31 @@ Value Interpreter::run_frame(Frame& frame) {
                 case OpCode::SetProp: set_prop(regs[in.dst], f.str_consts[static_cast<uint16_t>(in.imm16)], regs[in.src_a], in.src_b == 0); break;
                 case OpCode::GetElem: regs[in.dst] = get_elem(regs[in.src_a], regs[in.src_b]); break;
                 case OpCode::SetElem: set_elem(regs[in.dst], regs[in.src_a], regs[in.src_b], in.imm16 == 0); break;
+                case OpCode::GetSuperProp:
+                    regs[in.dst] = get_super_prop(
+                        regs[in.src_a],
+                        f.str_consts[static_cast<uint16_t>(in.imm16)],
+                        regs[in.src_b]);
+                    break;
+                case OpCode::SetSuperProp:
+                    set_super_prop(
+                        regs[in.dst],
+                        f.str_consts[static_cast<uint16_t>(in.imm16)],
+                        regs[in.src_a], regs[in.src_b]);
+                    break;
+                case OpCode::GetSuperElem:
+                    regs[in.dst] = get_super_prop(
+                        regs[in.src_a],
+                        to_property_key(
+                            regs[static_cast<uint16_t>(in.imm16)]),
+                        regs[in.src_b]);
+                    break;
+                case OpCode::SetSuperElem:
+                    set_super_prop(
+                        regs[in.dst], to_property_key(regs[in.src_b]),
+                        regs[static_cast<uint16_t>(in.imm16)],
+                        regs[in.src_a]);
+                    break;
                 case OpCode::GetLength: regs[in.dst] = array_or_string_length(regs[in.src_a]); break;
                 case OpCode::ToIterable: regs[in.dst] = make_iterable(regs[in.src_a], in.imm16 != 0); break;
 
@@ -997,10 +1809,12 @@ Value Interpreter::run_frame(Frame& frame) {
                     if (arrv.is_heap_ptr() && arrv.as_heap_ptr()->kind == HeapObject::kJSArray) {
                         auto* arr = static_cast<JSArray*>(arrv.as_heap_ptr());
                         if (in.imm16 == 0) {
-                            arr->elements.push_back(regs[in.src_a]);
-                        } else {
+                            arr->append(regs[in.src_a]);
+                        } else if (in.imm16 == 1) {
                             for (Value e : spread_args(make_iterable(regs[in.src_a], false)))
-                                arr->elements.push_back(e);
+                                arr->append(e);
+                        } else {
+                            arr->append(Value::make_undefined(), false);
                         }
                     }
                     break;
@@ -1011,7 +1825,8 @@ Value Interpreter::run_frame(Frame& frame) {
                     if (target.is_heap_ptr()) {
                         HeapObject* t = target.as_heap_ptr();
                         if (t->kind == HeapObject::kJSObject || t->kind == HeapObject::kJSArray)
-                            static_cast<JSObject*>(t)->define_accessor(nm, fnv, in.src_b != 0);
+                            static_cast<JSObject*>(t)->define_accessor(
+                                nm, fnv, (in.src_b & 1) != 0, (in.src_b & 2) != 0);
                         else if (t->kind == HeapObject::kJSFunction)
                             static_cast<JSFunction*>(t)->set(nm, fnv);  // static accessor: degraded to data
                     }
@@ -1019,11 +1834,12 @@ Value Interpreter::run_frame(Frame& frame) {
                 }
                 case OpCode::DefineAccessorV: {
                     Value target = regs[in.dst], fnv = regs[in.src_a];
-                    std::u16string nm = to_string(regs[in.src_b]);
+                    std::u16string nm = to_property_key(regs[in.src_b]);
                     if (target.is_heap_ptr()) {
                         HeapObject* t = target.as_heap_ptr();
                         if (t->kind == HeapObject::kJSObject || t->kind == HeapObject::kJSArray)
-                            static_cast<JSObject*>(t)->define_accessor(nm, fnv, in.imm16 != 0);
+                            static_cast<JSObject*>(t)->define_accessor(
+                                nm, fnv, (in.imm16 & 1) != 0, (in.imm16 & 2) != 0);
                         else if (t->kind == HeapObject::kJSFunction)
                             static_cast<JSFunction*>(t)->set(nm, fnv);
                     }
@@ -1034,7 +1850,7 @@ Value Interpreter::run_frame(Frame& frame) {
                     Value obj = regs[in.src_a];
                     std::u16string key = (in.op == OpCode::DeleteProp)
                         ? f.str_consts[static_cast<uint16_t>(in.imm16)]
-                        : to_string(regs[in.src_b]);
+                        : to_property_key(regs[in.src_b]);
                     bool ok = true;
                     if (obj.is_heap_ptr()) {
                         HeapObject* o = obj.as_heap_ptr();
@@ -1042,7 +1858,17 @@ Value Interpreter::run_frame(Frame& frame) {
                             auto* px = static_cast<JSProxy*>(o);
                             Value trap = get_prop(px->handler, u"deleteProperty");
                             if (is_callable(trap)) {
-                                std::vector<Value> a{px->target, str(key)};
+                                Value property_key =
+                                    in.op == OpCode::DeleteElem &&
+                                            regs[in.src_b].is_heap_ptr() &&
+                                            regs[in.src_b]
+                                                    .as_heap_ptr()
+                                                    ->kind ==
+                                                HeapObject::kJSSymbol
+                                        ? regs[in.src_b]
+                                        : str(key);
+                                std::vector<Value> a{
+                                    px->target, property_key};
                                 ok = to_bool(call(trap, px->handler, a));
                             } else if (px->target.is_heap_ptr() &&
                                        (px->target.as_heap_ptr()->kind == HeapObject::kJSObject ||
@@ -1056,7 +1882,7 @@ Value Interpreter::run_frame(Frame& frame) {
                             auto* a = static_cast<JSArray*>(o);
                             size_t idx;
                             if (parse_index(key, idx)) {
-                                if (idx < a->elements.size()) a->elements[idx] = Value::make_undefined();
+                                a->delete_index(idx);
                             } else {
                                 a->delete_prop(key);
                             }
@@ -1079,19 +1905,84 @@ Value Interpreter::run_frame(Frame& frame) {
                 }
                 case OpCode::CopyProps: {
                     Value dstv = regs[in.dst], srcv = regs[in.src_a];
-                    if (dstv.is_heap_ptr() && dstv.as_heap_ptr()->kind == HeapObject::kJSObject &&
-                        srcv.is_heap_ptr() && (srcv.as_heap_ptr()->kind == HeapObject::kJSObject ||
-                                               srcv.as_heap_ptr()->kind == HeapObject::kJSArray)) {
-                        auto* dst = static_cast<JSObject*>(dstv.as_heap_ptr());
-                        auto* src = static_cast<JSObject*>(srcv.as_heap_ptr());
-                        for (auto& p : src->props) if (p.enumerable) dst->set(p.key, p.value);
+                    if (!dstv.is_heap_ptr() ||
+                        dstv.as_heap_ptr()->kind != HeapObject::kJSObject ||
+                        srcv.is_null() || srcv.is_undefined())
+                        break;
+
+                    auto* dst = static_cast<JSObject*>(dstv.as_heap_ptr());
+                    if (srcv.is_heap_ptr()) {
+                        HeapObject* source = srcv.as_heap_ptr();
+                        if (source->kind == HeapObject::kJSString) {
+                            const auto& text =
+                                static_cast<JSString*>(source)->data;
+                            for (size_t i = 0; i < text.size(); ++i)
+                                dst->set(
+                                    u16(std::to_string(i)),
+                                    str(narrow(std::u16string(
+                                        1, text[i]))));
+                            break;
+                        }
+
+                        if (source->kind == HeapObject::kJSArray) {
+                            auto* array = static_cast<JSArray*>(source);
+                            for (size_t i = 0;
+                                 i < array->elements.size(); ++i) {
+                                if (!array->has_index(i)) continue;
+                                std::u16string key =
+                                    u16(std::to_string(i));
+                                dst->set(key, get_prop(srcv, key));
+                            }
+                        } else if (source->kind ==
+                                   HeapObject::kTypedArray) {
+                            auto* typed =
+                                static_cast<JSTypedArray*>(source);
+                            for (size_t i = 0; i < typed->length; ++i) {
+                                std::u16string key =
+                                    u16(std::to_string(i));
+                                dst->set(key, get_prop(srcv, key));
+                            }
+                        }
+
+                        switch (source->kind) {
+                            case HeapObject::kJSObject:
+                            case HeapObject::kJSArray:
+                            case HeapObject::kJSFunction:
+                            case HeapObject::kJSPromise:
+                            case HeapObject::kJSMap:
+                            case HeapObject::kJSSet:
+                            case HeapObject::kJSGenerator:
+                            case HeapObject::kTypedArray:
+                            case HeapObject::kDataView:
+                            case HeapObject::kArrayBuffer: {
+                                auto* object =
+                                    static_cast<JSObject*>(source);
+                                auto keys =
+                                    object->own_enumerable_keys();
+                                for (const auto& key : keys)
+                                    dst->set(
+                                        key,
+                                        get_prop(srcv, key));
+                                break;
+                            }
+                            default:
+                                break;
+                        }
                     }
                     break;
                 }
 
-                case OpCode::Return: frame.return_value = regs[in.src_a]; frame.returning = true; break;
-                case OpCode::ReturnUndefined: frame.return_value = Value::make_undefined(); frame.returning = true; break;
-                case OpCode::Throw: throw ThrowSignal{regs[in.src_a]};
+                case OpCode::Return:
+                    frame.return_value = regs[in.src_a];
+                    frame.returning = !unwind_return_to_finally(frame);
+                    break;
+                case OpCode::ReturnUndefined:
+                    frame.return_value = Value::make_undefined();
+                    frame.returning = !unwind_return_to_finally(frame);
+                    break;
+                case OpCode::Throw:
+                    frame.pending_return = false;
+                    throw ThrowSignal{regs[in.src_a]};
 
                 case OpCode::Await: {
                     if (frame.has_resume_value) {
@@ -1132,6 +2023,10 @@ Value Interpreter::run_frame(Frame& frame) {
                 case OpCode::PopHandler: if (!frame.handlers.empty()) frame.handlers.pop_back(); break;
                 case OpCode::EndFinally:
                     if (frame.pending_exc) { frame.pending_exc = false; throw ThrowSignal{frame.exc_value}; }
+                    if (frame.pending_return) {
+                        frame.pending_return = false;
+                        frame.returning = !unwind_return_to_finally(frame);
+                    }
                     break;
 
                 default:
@@ -1139,7 +2034,26 @@ Value Interpreter::run_frame(Frame& frame) {
                     break;
             }
         } catch (ThrowSignal& sig) {
-            if (!unwind_to_handler(frame, sig.value)) throw;  // propagate to caller
+            if (!unwind_to_handler(frame, sig.value)) {
+                if (std::getenv("MALIBU_TRACE_THROWS")) {
+                    std::u16string message;
+                    if (sig.value.is_heap_ptr() &&
+                        sig.value.as_heap_ptr()->kind == HeapObject::kJSObject) {
+                        auto* error = static_cast<JSObject*>(sig.value.as_heap_ptr());
+                        Value name = error->get(u"name");
+                        Value detail = error->get(u"message");
+                        if (!name.is_undefined()) message += to_string(name);
+                        if (!detail.is_undefined()) {
+                            if (!message.empty()) message += u": ";
+                            message += to_string(detail);
+                        }
+                    }
+                    std::fprintf(stderr, "[js-throw] %s\n",
+                                 narrow(message).c_str());
+                    trace_call_stack("throw escaping function frame");
+                }
+                throw;  // propagate to caller
+            }
         }
 
         if (frame.returning) return frame.return_value;
@@ -1155,12 +2069,27 @@ void Interpreter::enqueue_microtask(MicrotaskFn fn, std::vector<Value> roots) {
 }
 
 void Interpreter::run_microtasks() {
+    // A microtask checkpoint is never recursively entered. Work queued by a
+    // running microtask is still consumed by this outer checkpoint in FIFO
+    // order after the current callback has returned.
+    if (draining_microtasks_) return;
+    draining_microtasks_ = true;
+    struct DrainGuard {
+        bool& active;
+        ~DrainGuard() { active = false; }
+    } drain_guard{draining_microtasks_};
+
     while (!microtasks_.empty()) {
         Microtask mt = std::move(microtasks_.front());
         microtasks_.pop_front();
         size_t base = temp_roots_.size();
         for (Value v : mt.roots) temp_roots_.push_back(v);
-        if (mt.run) mt.run();
+        try {
+            if (mt.run) mt.run();
+        } catch (...) {
+            temp_roots_.resize(base);
+            throw;
+        }
         temp_roots_.resize(base);
     }
 }
@@ -1225,17 +2154,27 @@ void Interpreter::resolve_promise(JSPromise* p, Value value) {
             o->kind == HeapObject::kJSArray) {
             Value then = get_prop(value, u"then");
             if (is_callable(then)) {
-                JSPromise* self = p;
-                JSFunction* on_f = new_native(u"", [self](Interpreter& in, Value, std::vector<Value>& a) {
-                    in.resolve_promise(self, a.empty() ? Value::make_undefined() : a[0]);
+                Value promise_value = Value::make_heap_ptr(p);
+                JSFunction* on_f = new_native(u"", nullptr);
+                on_f->set(u"%promise%", promise_value, false);
+                on_f->native = [on_f](Interpreter& in, Value, std::vector<Value>& a) {
+                    auto* promise = static_cast<JSPromise*>(
+                        on_f->get(u"%promise%").as_heap_ptr());
+                    in.resolve_promise(
+                        promise, a.empty() ? Value::make_undefined() : a[0]);
                     return Value::make_undefined();
-                });
-                JSFunction* on_r = new_native(u"", [self](Interpreter& in, Value, std::vector<Value>& a) {
-                    in.reject_promise(self, a.empty() ? Value::make_undefined() : a[0]);
+                };
+                JSFunction* on_r = new_native(u"", nullptr);
+                on_r->set(u"%promise%", promise_value, false);
+                on_r->native = [on_r](Interpreter& in, Value, std::vector<Value>& a) {
+                    auto* promise = static_cast<JSPromise*>(
+                        on_r->get(u"%promise%").as_heap_ptr());
+                    in.reject_promise(
+                        promise, a.empty() ? Value::make_undefined() : a[0]);
                     return Value::make_undefined();
-                });
+                };
                 std::vector<Value> roots{value, then, Value::make_heap_ptr(on_f),
-                                         Value::make_heap_ptr(on_r), Value::make_heap_ptr(p)};
+                                         Value::make_heap_ptr(on_r), promise_value};
                 enqueue_microtask([this, value, then, on_f, on_r]() {
                     try {
                         std::vector<Value> args{Value::make_heap_ptr(on_f), Value::make_heap_ptr(on_r)};
@@ -1309,6 +2248,11 @@ Value Interpreter::call_async(JSFunction* fn, Value this_val, std::vector<Value>
     sf->env = heap_.alloc<Environment>();
     sf->env->parent = fn->closure;
     sf->env->is_function_scope = true;
+    if (fn->code->has_name_binding &&
+        !fn->code->name.empty())
+        sf->env->define(
+            fn->code->name,
+            Value::make_heap_ptr(fn));
     if (!fn->code->is_arrow) sf->env->define(u"%this%", this_val);
     for (size_t i = 0; i < fn->code->param_names.size(); ++i)
         sf->env->define(fn->code->param_names[i], i < args.size() ? args[i] : Value::make_undefined());
@@ -1318,6 +2262,14 @@ Value Interpreter::call_async(JSFunction* fn, Value this_val, std::vector<Value>
     sf->async_result = new_promise();
 
     suspended_frames_.push_back(sf);
+    if (std::getenv("MALIBU_TRACE_ASYNC"))
+        std::fprintf(
+            stderr,
+            "[async] start frame=%p promise=%p source=%s line=%u name=%s\n",
+            static_cast<void*>(sf.get()),
+            static_cast<void*>(sf->async_result),
+            sf->fn->source_name.c_str(), sf->fn->source_line,
+            narrow(sf->fn->name).c_str());
     Value result = Value::make_heap_ptr(sf->async_result);
     drive_async(sf);
     return result;
@@ -1326,10 +2278,21 @@ Value Interpreter::call_async(JSFunction* fn, Value this_val, std::vector<Value>
 void Interpreter::drive_async(std::shared_ptr<Frame> sf) {
     try {
         Value rv = run_frame(*sf);
+        if (std::getenv("MALIBU_TRACE_ASYNC"))
+            std::fprintf(stderr,
+                         "[async] complete frame=%p promise=%p pc=%zu\n",
+                         static_cast<void*>(sf.get()),
+                         static_cast<void*>(sf->async_result), sf->pc);
         resolve_promise(sf->async_result, rv);
     } catch (SuspendSignal&) {
         JSPromise* p = sf->await_promise;
         sf->await_promise = nullptr;
+        if (std::getenv("MALIBU_TRACE_ASYNC"))
+            std::fprintf(stderr,
+                         "[async] suspend frame=%p result=%p await=%p pc=%zu\n",
+                         static_cast<void*>(sf.get()),
+                         static_cast<void*>(sf->async_result),
+                         static_cast<void*>(p), sf->pc);
         std::weak_ptr<Frame> weak = sf;
         JSFunction* on_f = new_native(u"", [this, weak](Interpreter&, Value, std::vector<Value>& a) {
             if (auto s = weak.lock()) resume_async(s, a.empty() ? Value::make_undefined() : a[0], false);
@@ -1342,6 +2305,24 @@ void Interpreter::drive_async(std::shared_ptr<Frame> sf) {
         promise_then(p, Value::make_heap_ptr(on_f), Value::make_heap_ptr(on_r));
         return;  // frame remains rooted in suspended_frames_
     } catch (ThrowSignal& sig) {
+        if (std::getenv("MALIBU_TRACE_ASYNC")) {
+            std::u16string reason = to_string(sig.value);
+            if (sig.value.is_heap_ptr() &&
+                sig.value.as_heap_ptr()->kind == HeapObject::kJSObject) {
+                Value name = get_prop(sig.value, u"name");
+                Value message = get_prop(sig.value, u"message");
+                if (!name.is_undefined() || !message.is_undefined())
+                    reason = to_string(name) + u": " + to_string(message);
+            }
+            std::fprintf(stderr,
+                         "[async] reject frame=%p promise=%p source=%s "
+                         "line=%u name=%s pc=%zu reason=%s\n",
+                         static_cast<void*>(sf.get()),
+                         static_cast<void*>(sf->async_result),
+                         sf->fn->source_name.c_str(), sf->fn->source_line,
+                         narrow(sf->fn->name).c_str(), sf->pc,
+                         narrow(reason).c_str());
+        }
         reject_promise(sf->async_result, sig.value);
     }
     for (auto it = suspended_frames_.begin(); it != suspended_frames_.end(); ++it) {
@@ -1350,6 +2331,12 @@ void Interpreter::drive_async(std::shared_ptr<Frame> sf) {
 }
 
 void Interpreter::resume_async(std::shared_ptr<Frame> sf, Value value, bool is_throw) {
+    if (std::getenv("MALIBU_TRACE_ASYNC"))
+        std::fprintf(stderr,
+                     "[async] resume frame=%p promise=%p pc=%zu throw=%d\n",
+                     static_cast<void*>(sf.get()),
+                     static_cast<void*>(sf->async_result), sf->pc,
+                     is_throw ? 1 : 0);
     sf->has_resume_value = true;
     sf->resume_value = value;
     sf->resume_is_throw = is_throw;
@@ -1365,6 +2352,11 @@ Value Interpreter::make_generator(JSFunction* fn, Value this_val, std::vector<Va
     sf->env = heap_.alloc<Environment>();
     sf->env->parent = fn->closure;
     sf->env->is_function_scope = true;
+    if (fn->code->has_name_binding &&
+        !fn->code->name.empty())
+        sf->env->define(
+            fn->code->name,
+            Value::make_heap_ptr(fn));
     if (!fn->code->is_arrow) sf->env->define(u"%this%", this_val);
     for (size_t i = 0; i < fn->code->param_names.size(); ++i)
         sf->env->define(fn->code->param_names[i], i < args.size() ? args[i] : Value::make_undefined());

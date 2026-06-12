@@ -13,11 +13,13 @@
 #include "malibu/host/curl_resource_loader.h"
 
 #include <cstring>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -37,6 +39,28 @@ int main(int argc, char** argv) {
 
     malibu::view::View view;
     malibu::host::CurlResourceLoader loader;
+    view.set_socket_handler(
+        [&loader](int id, const std::string& url,
+                  const std::string& data, int kind) {
+            loader.websocket_command(id, url, data, kind);
+        });
+    auto dispatch_socket_events = [&] {
+        malibu::host::CurlResourceLoader::SocketEvent event;
+        while (loader.poll_websocket_event(event)) {
+            switch (event.type) {
+                case malibu::host::CurlResourceLoader::SocketEventType::Open:
+                    view.socket_open(event.id);
+                    break;
+                case malibu::host::CurlResourceLoader::SocketEventType::Message:
+                    view.socket_message(event.id, event.data);
+                    break;
+                case malibu::host::CurlResourceLoader::SocketEventType::Close:
+                    view.socket_close(
+                        event.id, event.code, event.reason);
+                    break;
+            }
+        }
+    };
     view.set_diagnostic_handler([](const malibu::view::LoadDiagnostic& diagnostic) {
         const char* kind = "resource";
         if (diagnostic.kind == malibu::view::LoadDiagnosticKind::Script)
@@ -49,10 +73,10 @@ int main(int argc, char** argv) {
 
     if (is_url) {
         // Host fetches the page + every subresource the engine asks for.
-        view.set_request_handler([&loader](
-            const std::string& url,
+        view.set_fetch_handler([&loader](
+            const malibu::network::FetchRequest& request,
             malibu::network::FetchResponse& out) -> bool {
-            return loader.fetch(url, out);
+            return loader.fetch(request, out);
         });
         malibu::network::FetchResponse page;
         if (!loader.fetch(input, page)) {
@@ -91,6 +115,43 @@ int main(int argc, char** argv) {
             out.body.assign(body.begin(), body.end()); out.status = 200; return true;
         });
         if (!view.load_html(ss.str(), "file://" + input)) { std::fprintf(stderr, "malibu_render: load failed\n"); return 1; }
+    }
+
+    if (const char* expression = std::getenv("MALIBU_EVAL_BEFORE_SETTLE")) {
+        std::fprintf(stderr, "[eval-before] %s\n",
+                     view.eval_js(expression).c_str());
+    }
+
+    uint64_t settle_ms = is_url ? 1500 : 0;
+    if (const char* value = std::getenv("MALIBU_SETTLE_MS"))
+        settle_ms = static_cast<uint64_t>(std::strtoull(value, nullptr, 10));
+    constexpr uint64_t kPumpStepMs = 50;
+    for (uint64_t elapsed = 0; elapsed < settle_ms; elapsed += kPumpStepMs) {
+        dispatch_socket_events();
+        view.run_tasks(std::min(kPumpStepMs, settle_ms - elapsed));
+        if (is_url)
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kPumpStepMs));
+    }
+    dispatch_socket_events();
+
+    if (std::getenv("MALIBU_PRERENDER_BEFORE_EVAL"))
+        (void)view.render(width, height);
+
+    if (const char* expression = std::getenv("MALIBU_EVAL")) {
+        std::fprintf(stderr, "[eval] %s\n",
+                     view.eval_js(expression).c_str());
+    }
+
+    if (std::getenv("MALIBU_DUMP_DOM")) {
+        std::string dump = view.eval_js(
+            "document.body ? document.body.outerHTML : '<no body>'");
+        constexpr size_t kMaxDump = 32 * 1024;
+        if (dump.size() > kMaxDump) {
+            dump.resize(kMaxDump);
+            dump += "...";
+        }
+        std::fprintf(stderr, "[dom] %s\n", dump.c_str());
     }
 
     if (full) {  // whole page in one tall image (capped for memory)

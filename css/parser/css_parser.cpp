@@ -2,8 +2,10 @@
 // Hand-written CSS Syntax Level 3 tokenizer + parser.
 
 #include "malibu/css/parser/css_parser.h"
+#include "malibu/css/selector/selector.h"
 #include "malibu/diagnostics/diagnostic_log.h"
 
+#include <algorithm>
 #include <cctype>
 #include <string>
 
@@ -21,6 +23,155 @@ std::u16string trim(std::u16string_view s) {
     while (b < e && ws(s[b])) ++b;
     while (e > b && ws(s[e - 1])) --e;
     return std::u16string(s.substr(b, e - b));
+}
+
+bool balanced_value(std::u16string_view value) {
+    std::vector<char16_t> stack;
+    char16_t quote = 0;
+    bool escaped = false;
+    for (char16_t c : value) {
+        if (quote != 0) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == u'\\') {
+                escaped = true;
+            } else if (c == quote) {
+                quote = 0;
+            }
+            continue;
+        }
+        if (c == u'"' || c == u'\'') {
+            quote = c;
+        } else if (c == u'(' || c == u'[' || c == u'{') {
+            stack.push_back(c);
+        } else if (c == u')' || c == u']' || c == u'}') {
+            if (stack.empty()) return false;
+            const char16_t expected =
+                c == u')' ? u'(' : c == u']' ? u'[' : u'{';
+            if (stack.back() != expected) return false;
+            stack.pop_back();
+        } else if (c == u';') {
+            return false;
+        }
+    }
+    return quote == 0 && stack.empty();
+}
+
+bool is_supported_property(std::u16string_view property) {
+    static constexpr std::u16string_view properties[] = {
+        u"align-items", u"aspect-ratio", u"background",
+        u"background-color", u"background-image", u"border",
+        u"border-bottom", u"border-bottom-color", u"border-bottom-width",
+        u"border-color", u"border-left", u"border-left-color",
+        u"border-left-width", u"border-radius", u"border-right",
+        u"border-right-color", u"border-right-width", u"border-style",
+        u"border-top", u"border-top-color", u"border-top-width",
+        u"border-width", u"bottom", u"box-shadow", u"box-sizing",
+        u"clear", u"color", u"column-gap", u"content", u"display",
+        u"fill", u"flex", u"flex-basis", u"flex-direction",
+        u"flex-grow", u"flex-shrink", u"flex-wrap", u"float", u"font",
+        u"font-family", u"font-size", u"font-style", u"font-weight",
+        u"gap", u"grid-gap", u"grid-template-columns", u"height",
+        u"justify-content", u"left", u"line-height", u"list-style",
+        u"list-style-type", u"margin", u"margin-bottom", u"margin-left",
+        u"margin-right", u"margin-top", u"max-height", u"max-width",
+        u"min-height", u"min-width", u"object-fit", u"opacity",
+        u"overflow", u"padding", u"padding-bottom", u"padding-left",
+        u"padding-right", u"padding-top", u"position", u"right",
+        u"row-gap", u"text-align", u"text-decoration",
+        u"text-decoration-line", u"text-transform", u"top", u"transform",
+        u"vertical-align", u"visibility", u"white-space", u"width",
+        u"z-index",
+    };
+    return std::find(std::begin(properties), std::end(properties), property) !=
+           std::end(properties);
+}
+
+bool one_of(std::u16string_view value,
+            std::initializer_list<std::u16string_view> values) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+bool supported_keyword_value(std::u16string_view property,
+                             std::u16string_view value) {
+    if (one_of(value, {u"inherit", u"initial", u"unset", u"revert",
+                       u"revert-layer"}))
+        return true;
+    if (property == u"display")
+        return one_of(value, {u"block", u"inline", u"inline-block", u"flex",
+                              u"inline-flex", u"grid", u"inline-grid",
+                              u"list-item", u"table", u"inline-table",
+                              u"table-row", u"table-cell", u"table-row-group",
+                              u"table-header-group", u"table-footer-group",
+                              u"none"});
+    if (property == u"position")
+        return one_of(value, {u"static", u"relative", u"absolute", u"fixed",
+                              u"sticky"});
+    if (property == u"float")
+        return one_of(value, {u"none", u"left", u"right"});
+    if (property == u"clear")
+        return one_of(value, {u"none", u"left", u"right", u"both"});
+    if (property == u"box-sizing")
+        return one_of(value, {u"content-box", u"border-box"});
+    if (property == u"visibility")
+        return one_of(value, {u"visible", u"hidden", u"collapse"});
+    if (property == u"overflow")
+        return one_of(value, {u"visible", u"hidden", u"scroll", u"auto"});
+    if (property == u"object-fit")
+        return one_of(value, {u"fill", u"contain", u"cover", u"none",
+                              u"scale-down"});
+    if (property == u"flex-direction")
+        return one_of(value, {u"row", u"row-reverse", u"column",
+                              u"column-reverse"});
+    if (property == u"flex-wrap")
+        return one_of(value, {u"nowrap", u"wrap", u"wrap-reverse"});
+    if (property == u"align-items")
+        return one_of(value, {u"stretch", u"flex-start", u"flex-end",
+                              u"center", u"baseline"});
+    if (property == u"justify-content")
+        return one_of(value, {u"flex-start", u"flex-end", u"center",
+                              u"space-between", u"space-around",
+                              u"space-evenly"});
+    if (property == u"white-space")
+        return one_of(value, {u"normal", u"nowrap", u"pre", u"pre-wrap"});
+    if (property == u"text-transform")
+        return one_of(value, {u"none", u"uppercase", u"lowercase",
+                              u"capitalize"});
+    if (property == u"vertical-align")
+        return one_of(value, {u"baseline", u"top", u"middle", u"bottom",
+                              u"sub", u"super"});
+    if (property == u"font-style")
+        return one_of(value, {u"normal", u"italic", u"oblique"});
+    return true;
+}
+
+bool supported_pseudo_classes(const ComplexSelector& selector) {
+    static constexpr std::u16string_view pseudos[] = {
+        u"active", u"any-link", u"checked", u"disabled", u"empty",
+        u"enabled", u"first-child", u"focus", u"focus-within", u"hover",
+        u"is", u"last-child", u"link", u"matches", u"not", u"nth-child",
+        u"nth-last-child", u"nth-last-of-type", u"nth-of-type",
+        u"only-child", u"root", u"where",
+    };
+    for (const auto& step : selector.steps) {
+        for (const auto& pseudo : step.second.pseudos) {
+            if (std::find(std::begin(pseudos), std::end(pseudos),
+                          pseudo.name) == std::end(pseudos))
+                return false;
+        }
+    }
+    return true;
+}
+
+size_t find_top_level(std::u16string_view text,
+                      std::u16string_view needle) {
+    int depth = 0;
+    for (size_t i = 0; i + needle.size() <= text.size(); ++i) {
+        if (text[i] == u'(') ++depth;
+        else if (text[i] == u')') --depth;
+        if (depth == 0 && text.substr(i, needle.size()) == needle) return i;
+    }
+    return std::u16string_view::npos;
 }
 
 class Parser {
@@ -211,6 +362,55 @@ private:
 StyleSheet CSSParser::parse(std::u16string_view source) {
     Parser p(source);
     return p.parse();
+}
+
+bool supports_property_value(std::u16string_view raw_property,
+                             std::u16string_view raw_value) {
+    const std::u16string property = lower(trim(raw_property));
+    const std::u16string value = lower(trim(raw_value));
+    if (property.empty() || value.empty() || !balanced_value(value))
+        return false;
+    if (property.rfind(u"--", 0) == 0) return property.size() > 2;
+    return is_supported_property(property) &&
+           supported_keyword_value(property, value);
+}
+
+bool supports_selector(std::u16string_view raw_selector) {
+    const std::u16string selector = trim(raw_selector);
+    if (selector.empty()) return false;
+    const ComplexSelector parsed = parse_selector(selector);
+    return parsed.valid && supported_pseudo_classes(parsed);
+}
+
+bool supports_condition(std::u16string_view raw_condition) {
+    std::u16string condition = lower(trim(raw_condition));
+    if (condition.empty()) return false;
+    if (condition.rfind(u"not ", 0) == 0)
+        return !supports_condition(condition.substr(4));
+
+    size_t op = find_top_level(condition, u" and ");
+    if (op != std::u16string::npos)
+        return supports_condition(condition.substr(0, op)) &&
+               supports_condition(condition.substr(op + 5));
+    op = find_top_level(condition, u" or ");
+    if (op != std::u16string::npos)
+        return supports_condition(condition.substr(0, op)) ||
+               supports_condition(condition.substr(op + 4));
+
+    if (condition.rfind(u"selector(", 0) == 0 &&
+        condition.back() == u')')
+        return supports_selector(
+            condition.substr(9, condition.size() - 10));
+    if (condition.front() == u'(' && condition.back() == u')') {
+        const std::u16string inner =
+            trim(condition.substr(1, condition.size() - 2));
+        const size_t colon = inner.find(u':');
+        if (colon != std::u16string::npos)
+            return supports_property_value(inner.substr(0, colon),
+                                           inner.substr(colon + 1));
+        return supports_condition(inner);
+    }
+    return false;
 }
 
 } // namespace malibu::css
