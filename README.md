@@ -83,7 +83,7 @@ In Progress:
 ## Building
 
 ```bash
-git clone https://github.com/korinel/malibu.git
+git clone https://github.com/korinel/malibu
 cd malibu
 
 cmake -B build -G Ninja
